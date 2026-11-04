@@ -19,7 +19,7 @@ export const dynamic = "force-dynamic";
 
 const searchSchema = z.object({
   provider: z.enum(["osm", "google_places"]),
-  country: z.string().trim().min(1, "Enter the country.").max(120),
+  country: z.string().trim().max(120).default(""),
   city: z.string().trim().min(1, "Enter the city.").max(120),
   categories: z.array(z.enum(CATEGORY_KEYS)).min(1, "Choose at least one category.").max(8),
   limit: z.coerce.number().int().min(1).max(200).default(50),

@@ -55,8 +55,10 @@ export const env = {
     endpoint: process.env.OVERPASS_ENDPOINT ?? "https://overpass-api.de/api/interpreter",
     endpoints: list(process.env.OVERPASS_ENDPOINTS),
     cacheMinutes: num(process.env.OVERPASS_CACHE_MINUTES, 60),
-    timeoutMs: num(process.env.OVERPASS_TIMEOUT_MS, 55_000),
-    retries: num(process.env.OVERPASS_RETRIES, 2),
+    // One attempt per mirror: when public Overpass is busy, fall back quickly
+    // to the Nominatim index instead of making the user wait through retries.
+    timeoutMs: num(process.env.OVERPASS_TIMEOUT_MS, 20_000),
+    retries: num(process.env.OVERPASS_RETRIES, 0),
   },
   googlePlaces: {
     apiKey: process.env.GOOGLE_PLACES_API_KEY ?? "",

@@ -106,24 +106,26 @@ limitation affects a user decision, the UI is expected to say so honestly.
 ## AI planning and maps
 
 39. **Gemini, xAI Grok and Groq are optional planners, not data sources.** They receive
-    the user's description and return only country, city, categories, a limit and a target
-    provider. They cannot add businesses, contacts or websites. Without a key, the planner
-    card says so and manual discovery remains available.
+    the user's description and return only city, an optional country, categories, a limit
+    and a target provider. They cannot add businesses, contacts or websites. Without a key,
+    the assistant says so and manual discovery remains available.
 40. **Plans can be imperfect.** The app validates and normalises the model's output
-    (category aliases, 1–8 categories, 1–200 results) and rejects missing locations, but a
+    (category aliases, 1–8 categories, 1–200 results) and rejects a missing city, but a
     plan may still be too broad or miss a niche category. Review the filters before
-    running.
+    running. A missing country is accepted and searched as a city name.
 41. **Public Overpass is a shared, best-effort service.** It can take 30–60 seconds, return
-    502 "at capacity", time out, or rate-limit. The app backs off, retries and falls back
-    to `OVERPASS_ENDPOINTS`, then reports the failure honestly. It does not substitute a
-    regional mirror that would silently return incomplete data.
+    502 "at capacity", time out, or rate-limit. Discovery therefore reads the Nominatim POI
+    index first and only tries Overpass when that index has no matches. Both are free,
+    keyless community services; failures are reported honestly and nothing is saved.
 42. **Map positions are source coordinates.** Leaflet/OpenStreetMap markers show where the
     source placed a business; they are not verified addresses. Tiles require internet
     access and are subject to the OpenStreetMap tile usage policy. Up to 200 mapped results
     are shown per run.
-43. **Nominatim geocoding is rate-limited.** Requests are cached and throttled to one per
-    second, per process. Set `GEOCODE_USER_AGENT` to a real contact before public use.
-    Place names that Nominatim cannot resolve fall back to manual city/country entry.
+43. **Nominatim is rate-limited and keyword-based.** Geocoding and POI queries share a one
+    request/second, per-process throttle with caching. Exact tag queries such as
+    `[amenity=dentist]` are used inside the city box; categories without a reliable tag fall
+    back to free-text search. Coverage is community-maintained and can be thinner in some
+    areas. Set `GEOCODE_USER_AGENT` to a real contact before public use.
 44. **Google Places result caps apply.** Text Search returns at most 20 places per request;
     the app does not paginate for more. Its terms and billing are the key owner's
     responsibility.
@@ -131,8 +133,9 @@ limitation affects a user decision, the UI is expected to say so honestly.
     keys during this build, newer Flash models can return 503 under load, and Groq's
     account-specific model list varies. Defaults are configurable via `GEMINI_MODEL`,
     `GROK_MODEL` and `GROQ_MODEL`; `auto` falls back to another configured planner and says
-    so in the plan. An explicitly selected planner that fails reports the upstream error
-    rather than silently switching.
+    so in the chat reply. A user-input error such as a missing city stops the chain instead
+    of retrying every model, and an explicitly selected planner that fails reports the
+    upstream error rather than silently switching.
 
 ## Product boundary
 

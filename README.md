@@ -17,11 +17,12 @@ human reviews and works through.
 
 - **Import** CSV, TSV, GeoJSON and ZIP uploads with column mapping, preview, row-level
   error reporting, duplicate detection, undo-safe merges and cancellation.
-- **Discover** businesses from OpenStreetMap (Overpass API) and, when a key is present,
-  Google Places. Optional Gemini, xAI Grok or Groq planning turns plain language into
-  validated search filters — the models never supply leads. A Leaflet/OpenStreetMap map
-  previews the search area and plots real result coordinates. Providers are honest about
-  availability; there are no placeholder results.
+- **Discover** businesses from OpenStreetMap (Nominatim POI index, with Overpass as a
+  backup) and, when a key is present, Google Places. A chat-style AI assistant powered by
+  Gemini, xAI Grok or Groq turns plain language into validated search filters - the models
+  never supply leads. A Leaflet/OpenStreetMap map previews the search area and plots real
+  result coordinates. Providers are honest about availability; there are no placeholder
+  results.
 - **Scan** public websites with a hardened fetcher: SSRF/DNS-rebinding protection,
   redirect re-validation, `robots.txt` checks, per-host politeness delays, timeouts, body
   size caps and a fixed user agent.
@@ -138,9 +139,9 @@ All variables are documented in [`.env.example`](.env.example). The most importa
 | `MAX_UPLOAD_BYTES` | 50 MiB | Upload cap |
 | `SCAN_*` | see example | Timeouts, page count, politeness, UA |
 | `ALLOW_PRIVATE_TARGETS_FOR_TESTS` | `false` | Test-only; startup fails in production |
-| `OVERPASS_ENDPOINT` | public OSM endpoint | Primary real discovery source |
+| `OVERPASS_ENDPOINT` | public OSM endpoint | Backup tag search when the POI index is empty |
 | `OVERPASS_ENDPOINTS` | empty | Comma-separated fallback mirrors |
-| `OVERPASS_TIMEOUT_MS` / `OVERPASS_RETRIES` | `55000` / `1` | Per-attempt timeout and retries |
+| `OVERPASS_TIMEOUT_MS` / `OVERPASS_RETRIES` | `20000` / `0` | Per-attempt timeout and retries |
 | `OVERPASS_CACHE_MINUTES` | `60` | In-memory cache for identical queries |
 | `GOOGLE_PLACES_API_KEY` | empty | Empty means the provider reports unavailable |
 | `GEOCODE_USER_AGENT` | scanner UA | Set a real contact for Nominatim in production |
@@ -156,24 +157,29 @@ Production startup refuses to run with the development auth secret or with
 ## Discovery, AI planning and maps
 
 Discovery has two real sources: OpenStreetMap (no key) and Google Places (key required).
-Search `/discovery` manually, or describe what you want and let Gemini, xAI Grok or Groq
+Search `/discovery` manually, or chat with the AI assistant and let Gemini, xAI Grok or Groq
 produce a plan:
 
-1. The planner returns only `country`, `city`, categories (1–8), a result limit and a
-   target provider. It has no schema fields for businesses, contacts or websites.
-2. The app validates the plan and shows the filters for review.
+1. The planner returns only `city`, an optional `country`, categories (1–8), a result limit
+   and a target provider. It has no schema fields for businesses, contacts or websites.
+2. The app validates the plan and shows the filters as a chat reply. A city is required; a
+   missing country is allowed and noted.
 3. Running the plan calls the live source, imports through the normal dedupe pipeline
    and plots returned coordinates on the OpenStreetMap map.
 
-If no AI key is set, the planner card says so and manual discovery still works. `auto`
+If no AI key is set, the assistant says so and manual discovery still works. `auto`
 prefers Groq for speed, then Gemini, then Grok, and transparently falls back if a planner
-fails (the plan preview shows which model was used). If Overpass is overloaded, the app
-retries, tries `OVERPASS_ENDPOINTS` mirrors in order and returns an honest error with the
-attempt count. Nothing is saved on failure.
+fails (the chat reply shows which model was used). An invalid plan such as a missing city
+stops the chain and shows the reason instead of retrying every model.
 
-Maps use Leaflet with OpenStreetMap tiles. Geocoding uses Nominatim with a 1 request/second
-throttle and caching. Positions are source coordinates, not verified addresses. Set
-`GEOCODE_USER_AGENT` to a real contact URL/email before public deployment.
+OpenStreetMap discovery reads the public Nominatim POI index with exact tag queries such as
+`[amenity=dentist]` inside the geocoded city box. It is free, keyless and normally answers
+in 1–4 seconds. If the index has no matches, the app tries Overpass as a backup and reports
+an honest error if both fail. Nothing is saved on failure.
+
+Maps use Leaflet with OpenStreetMap tiles. Geocoding and POI queries share a 1 request/second
+Nominatim throttle with caching. Positions are source coordinates, not verified addresses.
+Set `GEOCODE_USER_AGENT` to a real contact URL/email before public deployment.
 
 ## Data safety
 

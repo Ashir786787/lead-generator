@@ -17,6 +17,9 @@ export interface GeocodeResult {
   lat: number;
   lng: number;
   bounds: GeocodeBounds | null;
+  /** OSM element behind the match, used to query Overpass by area id. */
+  osmType: "node" | "way" | "relation" | null;
+  osmId: number | null;
 }
 
 const nominatimSchema = z.array(
@@ -24,6 +27,8 @@ const nominatimSchema = z.array(
     display_name: z.string(),
     lat: z.string(),
     lon: z.string(),
+    osm_type: z.enum(["node", "way", "relation"]).optional(),
+    osm_id: z.number().optional(),
     boundingbox: z.array(z.string()).length(4).optional(),
     address: z
       .object({
@@ -79,6 +84,8 @@ export function parseGeocodeResults(payload: unknown): GeocodeResult[] {
       lat,
       lng,
       bounds,
+      osmType: item.osm_type ?? null,
+      osmId: typeof item.osm_id === "number" ? item.osm_id : null,
     });
   }
   return results.slice(0, 6);
@@ -103,6 +110,11 @@ async function waitForNominatimSlot(): Promise<void> {
   const wait = lastRequestAt + minimumInterval - Date.now();
   if (wait > 0) await sleep(wait);
   lastRequestAt = Date.now();
+}
+
+/** Shared 1 req/s Nominatim throttle so geocoding and POI fallback stay polite. */
+export function awaitNominatimSlot(): Promise<void> {
+  return waitForNominatimSlot();
 }
 
 export function clearGeocodeCache(): void {

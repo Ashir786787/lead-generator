@@ -10,6 +10,8 @@ import type { ColumnMapping } from "@/lib/import/mapping";
 import { logger } from "@/lib/logger";
 import { CATEGORY_OPTIONS } from "@/lib/constants";
 import type { CategoryKey } from "@/lib/score/types";
+import { clearGeocodeCache, geocodePlace, type GeocodeBounds } from "@/lib/discovery/geocode";
+import { clearNominatimPlaceCache, searchNominatimPlaces } from "@/lib/discovery/nominatim";
 
 export type DiscoveryProvider = "osm" | "google_places";
 
@@ -36,7 +38,7 @@ export function providerStatuses(): DiscoveryProviderStatus[] {
       label: "OpenStreetMap (Overpass)",
       available: true,
       detail:
-        "Live public business listings from OpenStreetMap. No API key needed. Please keep searches small — Overpass is a shared community service.",
+        "Live public business listings from OpenStreetMap. No API key needed. Businesses are read from the OpenStreetMap POI index, with Overpass as a backup. Please keep searches small — these are shared community services.",
       attribution: "© OpenStreetMap contributors (ODbL)",
     },
     {
@@ -90,7 +92,12 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").slice(0, 120);
 }
 
-function buildOverpassQuery(request: DiscoveryRequest): string {
+export interface SearchArea {
+  bounds: GeocodeBounds | null;
+  areaId: number | null;
+}
+
+function buildOverpassQuery(request: DiscoveryRequest, area: SearchArea | null = null): string {
   const areaMatchers = request.categories.flatMap((category) => OSM_FILTERS[category] ?? []);
   const unique = [...new Set(areaMatchers)];
   if (!unique.length) {
@@ -98,20 +105,56 @@ function buildOverpassQuery(request: DiscoveryRequest): string {
   }
   const city = escapeRegex(request.city);
   const country = escapeRegex(request.country);
-  const lines = [
-    "[out:json][timeout:45]",
-    `area["name"~"^${city}$",i]["boundary"="administrative"]->.searchArea;`,
-  ];
-  if (country) {
-    lines.push(`area["name"~"^${country}$",i]["boundary"="administrative"]->.countryArea;`);
+  const lines = ["[out:json][timeout:45]"];
+
+  let matcherSuffix: string;
+  if (area?.areaId) {
+    // A resolved OSM relation is exact and much cheaper than scanning area names.
+    lines.push(`area(${area.areaId})->.searchArea;`);
+    matcherSuffix = "(area.searchArea)";
+  } else if (area?.bounds) {
+    // A geocoded bounding box avoids the expensive name/administrative lookups.
+    const { south, west, north, east } = area.bounds;
+    matcherSuffix = `(${south},${west},${north},${east})`;
+  } else {
+    lines.push(`area["name"~"^${city}$",i]["boundary"="administrative"]->.searchArea;`);
+    if (country) {
+      lines.push(`area["name"~"^${country}$",i]["boundary"="administrative"]->.countryArea;`);
+    }
+    matcherSuffix = country ? "(area.searchArea)(area.countryArea)" : "(area.searchArea)";
   }
+
   lines.push("(");
   for (const filter of unique) {
-    lines.push(`  nwr${filter}${country ? "(area.searchArea)(area.countryArea)" : "(area.searchArea)"};`);
+    lines.push(`  nwr${filter}${matcherSuffix};`);
   }
   lines.push(");");
   lines.push(`out center tags ${Math.min(200, Math.max(1, request.limit))};`);
   return lines.join("\n");
+}
+
+/**
+ * Resolve the city to an OSM area id or bounding box so the Overpass query is
+ * small. Failure is not fatal: the caller falls back to a name query.
+ */
+async function resolveSearchArea(request: DiscoveryRequest): Promise<SearchArea | null> {
+  if (!request.city.trim()) return null;
+  try {
+    const query = request.country.trim()
+      ? `${request.city.trim()}, ${request.country.trim()}`
+      : request.city.trim();
+    const results = await geocodePlace(query);
+    const best = results.find((result) => result.bounds) ?? results[0];
+    if (!best) return null;
+    const areaId =
+      best.osmType === "relation" && typeof best.osmId === "number" && best.osmId > 0
+        ? 3_600_000_000 + best.osmId
+        : null;
+    return { bounds: best.bounds, areaId };
+  } catch (error) {
+    logger.warn({ err: error }, "Could not geocode the search area; using an Overpass name query");
+    return null;
+  }
 }
 
 /** Public Overpass mirrors, in priority order, with duplicates removed. */
@@ -168,6 +211,8 @@ function writeCachedOverpass(key: string, records: Record<string, unknown>[]): v
 /** Test helper: clear the in-memory discovery caches between cases. */
 export function clearDiscoveryCaches(): void {
   overpassCache.clear();
+  clearNominatimPlaceCache();
+  clearGeocodeCache();
 }
 
 type AttemptFailure = {
@@ -177,11 +222,24 @@ type AttemptFailure = {
   retryAfterMs?: number;
 };
 
-function overpassErrorDetail(status: number, body: string): string {
-  if (/at capacity|queue is full|too many requests/i.test(body)) return `HTTP ${status} (server at capacity)`;
-  if (/whitelist|not allowed|forbidden/i.test(body)) return `HTTP ${status} (mirror refused this client)`;
-  if (/timed?\s*out/i.test(body)) return `HTTP ${status} (query timed out)`;
-  return `HTTP ${status}`;
+function overpassErrorDetail(
+  status: number,
+  body: string,
+): { message: string; runtime: boolean } {
+  const runtime =
+    /runtime error|timed?\s*out|too busy|queue is full|at capacity|dispatcher|out of memory|open64/i.test(
+      body,
+    );
+  if (/at capacity|queue is full|too many requests/i.test(body)) {
+    return { message: `HTTP ${status} (server at capacity)`, runtime: true };
+  }
+  if (/whitelist|not allowed|forbidden/i.test(body)) {
+    return { message: `HTTP ${status} (mirror refused this client)`, runtime: false };
+  }
+  if (runtime) {
+    return { message: `HTTP ${status} (server busy or query timed out)`, runtime: true };
+  }
+  return { message: `HTTP ${status}`, runtime: false };
 }
 
 async function fetchOverpassOnce(
@@ -205,10 +263,13 @@ async function fetchOverpassOnce(
     if (!response.ok) {
       const body = await response.text().catch(() => "");
       const retryAfter = Number(response.headers.get("retry-after"));
+      const detail = overpassErrorDetail(response.status, body);
       return {
         endpoint,
-        message: overpassErrorDetail(response.status, body),
-        retryable: isRetryableStatus(response.status),
+        message: detail.message,
+        // Overpass reports runtime overload (queue full, timeout, out of memory)
+        // as HTTP 400, so a 400 is not automatically a permanent query error.
+        retryable: isRetryableStatus(response.status) || (response.status === 400 && detail.runtime),
         retryAfterMs:
           Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(15_000, retryAfter * 1000) : undefined,
       };
@@ -272,8 +333,11 @@ function parseOverpassElements(elements: OverpassElement[]): Record<string, unkn
   return records;
 }
 
-async function runOverpass(request: DiscoveryRequest): Promise<Record<string, unknown>[]> {
-  const query = buildOverpassQuery(request);
+async function runOverpass(
+  request: DiscoveryRequest,
+  area: SearchArea | null,
+): Promise<Record<string, unknown>[]> {
+  const query = buildOverpassQuery(request, area);
   const cacheKey = hashText(query);
   const cached = readCachedOverpass(cacheKey);
   if (cached) {
@@ -328,9 +392,9 @@ async function runOverpass(request: DiscoveryRequest): Promise<Record<string, un
     ? `${last.message} from ${safeHost(last.endpoint)}`
     : "no endpoint configured";
   const mirrorHint =
-    endpoints.length > 1 ? "" : " Add another mirror with OVERPASS_ENDPOINTS for automatic fallback.";
+    endpoints.length > 1 ? "" : " Add another mirror with OVERPASS_ENDPOINTS for extra fallback.";
   throw conflict(
-    `OpenStreetMap could not be reached after ${failures.length} attempt${failures.length === 1 ? "" : "s"} (${summary}). This is usually temporary upstream overload — retry in a minute, pick a smaller area, or use Google Places if configured.${mirrorHint}`,
+    `OpenStreetMap (Overpass) could not be reached after ${failures.length} attempt${failures.length === 1 ? "" : "s"}: ${summary}.${mirrorHint}`,
   );
 }
 
@@ -345,8 +409,59 @@ function safeHost(endpoint: string): string {
 /** Public wrapper used by tests and runDiscovery; keeps retry/cache behaviour in one place. */
 export async function searchOsmRecords(
   request: DiscoveryRequest,
+  area: SearchArea | null = null,
 ): Promise<Record<string, unknown>[]> {
-  return runOverpass(request);
+  return runOverpass(request, area);
+}
+
+export type OsmDiscoverySource = "overpass" | "nominatim";
+
+export interface OsmDiscoveryOutcome {
+  records: Record<string, unknown>[];
+  via: OsmDiscoverySource;
+  /** Honest note when the primary source was unavailable. */
+  note: string | null;
+}
+
+/**
+ * Live OSM discovery that stays fast and reliable:
+ * 1. resolve the city to a bounding box (Nominatim geocoder, cached);
+ * 2. read businesses from the OpenStreetMap POI index (same data and source
+ *    ids as Overpass), one polite query per category;
+ * 3. if the index has no matches or is unavailable, query Overpass tags as a
+ *    backup, because some venue types are tagged but not keyword-searchable.
+ */
+export async function discoverOsmRecords(
+  request: DiscoveryRequest,
+): Promise<OsmDiscoveryOutcome> {
+  const area = await resolveSearchArea(request);
+
+  const index = await searchNominatimPlaces(request, area?.bounds ?? null);
+  if (index.records.length) {
+    logger.info(
+      { via: "nominatim", count: index.records.length },
+      "Discovery source responded through the OSM POI index",
+    );
+    return { records: index.records, via: "nominatim", note: index.note };
+  }
+
+  try {
+    const records = await runOverpass(request, area);
+    return {
+      records,
+      via: "overpass",
+      note: index.note ? `The OSM POI index reported: ${index.note}` : null,
+    };
+  } catch (error) {
+    if (!index.failed) {
+      // The index answered honestly with zero matches; that is not an outage.
+      return { records: [], via: "nominatim", note: index.note };
+    }
+    const message = error instanceof Error ? error.message : "unknown error";
+    throw conflict(
+      `OpenStreetMap could not be reached. ${message} The Nominatim POI index also failed (${index.note ?? "no response"}). Retry in a minute or pick a smaller area.`,
+    );
+  }
 }
 
 interface GooglePlace {
@@ -421,6 +536,8 @@ async function runGooglePlaces(request: DiscoveryRequest): Promise<Record<string
 
 export interface DiscoveryResult {
   provider: DiscoveryProvider;
+  /** Which OSM path answered; null for Google Places. */
+  via: OsmDiscoverySource | null;
   found: number;
   importJobId: string | null;
   counts: IngestCounts | null;
@@ -455,19 +572,22 @@ export async function runDiscovery(
   ctx: WorkspaceContext,
   request: DiscoveryRequest,
 ): Promise<DiscoveryResult> {
-  const records =
-    request.provider === "osm" ? await searchOsmRecords(request) : await runGooglePlaces(request);
+  const outcome =
+    request.provider === "osm"
+      ? await discoverOsmRecords(request)
+      : { records: await runGooglePlaces(request), via: null, note: null };
+  const records = outcome.records;
 
   if (!records.length) {
     return {
       provider: request.provider,
+      via: outcome.via,
       found: 0,
       importJobId: null,
       counts: null,
       sample: [],
       mapped: [],
-      message:
-        "No businesses matched this search. Check the city spelling or widen the categories. Nothing was saved.",
+      message: `No businesses matched this search. Check the city spelling or widen the categories. Nothing was saved.${outcome.note ? ` ${outcome.note}` : ""}`,
     };
   }
 
@@ -524,6 +644,7 @@ export async function runDiscovery(
     );
     return {
       provider: request.provider,
+      via: outcome.via,
       found: records.length,
       importJobId: job.id,
       counts,
@@ -541,7 +662,7 @@ export async function runDiscovery(
         )
         .slice(0, 200)
         .map((record) => ({ name: String(record.name ?? ""), lat: record.lat, lng: record.lng })),
-      message: `Found ${records.length} businesses. ${counts.newCount} new, ${counts.mergedCount} merged, ${counts.reviewCount} sent to duplicate review.`,
+      message: `Found ${records.length} businesses. ${counts.newCount} new, ${counts.mergedCount} merged, ${counts.reviewCount} sent to duplicate review.${outcome.note ? ` ${outcome.note}` : ""}`,
     };
   } catch (error) {
     logger.error({ err: error, provider: request.provider }, "Discovery import failed");

@@ -17,13 +17,13 @@ Final result on 2026-11-04:
 | --- | --- |
 | `pnpm typecheck` | Pass (no output) |
 | `pnpm lint` | Pass, 0 errors. One non-blocking React Compiler warning for TanStack Table's `useReactTable` |
-| `pnpm test` | Pass — 10 files, 132 tests |
+| `pnpm test` | Pass — 10 files, 139 tests |
 | `pnpm build` | Pass — 41 app paths compiled |
 | `pnpm exec playwright test` | Pass — 16 tests (1 setup + 15 Chromium) |
 | Screenshots | 60 PNGs at 1440/1024/390, light/dark |
-| Live discovery | Overpass retry/cache path exercised; honest 502 message verified when the public service was at capacity |
+| Live discovery | Nominatim POI index returned real records in 1.5–3.8 s for Lisbon dentists (30), Berlin cafes (20), Karachi restaurants (25) and Madrid law firms (19); honest combined error covered by tests |
 | Live map | Nominatim geocode returned Lisbon bounds; Leaflet loaded OSM tiles with no console errors |
-| AI planner | Live Gemini (`gemini-3.1-flash-lite`, 1.3–22.6s across calls) and Groq (`qwen/qwen3.8-27b`, 0.3–0.6s) returned validated filters; auto mode resolved in 0.3s via Groq; fallback/no-key paths covered by tests |
+| AI planner | Live Groq (`qwen/qwen3.8-27b`, 0.24–0.46 s) returned validated filters for all prompts, including a city without a country; auto fallback, missing-city stop and no-key paths covered by tests |
 
 ## Phases
 
@@ -41,6 +41,7 @@ Final result on 2026-11-04:
 | 9 | UI: app shell, dashboard, leads, lead detail, duplicates, imports, discovery, scans, settings, scoring, login/setup | typecheck/lint; responsive review; screenshots |
 | 10 | Tests, acceptance, docs, demo seed, screenshots, git history | full gate + Playwright + acceptance |
 | 11 | Discovery resilience and AI/map: Overpass retries/fallback/cache, Gemini, xAI Grok and Groq filter planners, Nominatim geocoding, Leaflet result map | full gate + live planner/geocode/map checks + honest upstream-failure check |
+| 12 | Reliable free discovery and chat assistant: Nominatim POI tag search first, Overpass backup, city-only searches, chat-style plan replies, early stop on invalid plans | full gate + live API planner/discovery checks |
 
 ## Acceptance run
 
@@ -188,7 +189,7 @@ results.
 The planner is deliberately constrained: it receives only the user's description, must
 return a JSON filter object, and the server validates it with Zod before use. The schema
 has no business/contact fields. Unsupported categories are dropped with a visible note,
-missing locations are rejected, and Google Places plans fall back to OpenStreetMap when no
+missing cities are rejected, and Google Places plans fall back to OpenStreetMap when no
 key is configured. The models never generate rows in the lead table.
 
 ### AI planner model names changed under us
@@ -215,6 +216,31 @@ assets are needed. The CSP `img-src` was extended for `*.tile.openstreetmap.org`
 `.leaflet-container` is isolated so tile panes cannot sit above app chrome. A live check
 confirmed 8 tiles loaded with no console errors.
 
+### Public Overpass made discovery feel broken
+
+Live checks after the first resilience round still failed for users: overpass-api.de took
+20–48 s, returned 502 "at capacity", or reported a runtime error as HTTP 400. A mirror
+list was not a real fix because several public mirrors were dead, slower or regionally
+incomplete. The user-visible result was a red error for a perfectly valid search.
+
+Fix: OpenStreetMap discovery now reads the **Nominatim POI index first** with exact tag
+queries such as `[amenity=dentist]` bounded to the geocoded city box. It is the same OSM
+data, needs no key, and answered in 1.5–3.8 s for Lisbon, Berlin, Karachi and Madrid in
+live checks (30/20/25/19 named records). Overpass remains a backup for categories the
+index cannot find, and both sources share the existing `osm:<type>/<id>` ids so dedupe is
+unchanged. Named businesses only: unnamed POIs are skipped rather than turned into junk
+leads. The UI labels the real source honestly.
+
+### The planner rejected valid city-only prompts
+
+The parser required both `city` and `country`, so "cafes in Berlin" produced "The plan is
+missing a location". Auto mode then retried every model, turning one user-input problem
+into a slow multi-provider failure. Country is now optional with a visible note, a missing
+city is still rejected, and a `400` from plan validation stops the auto chain immediately.
+Gemini's timeout was raised to 40 s and output tokens capped at 400; Groq stayed at
+0.24–0.46 s in live checks. The planner card is now a chat-style assistant with a message
+thread, Enter-to-send and example prompts, while still returning only filters.
+
 ## Decision log (abbreviated)
 
 - Local PostgreSQL runs through `embedded-postgres` on port 5433 because Docker and a
@@ -229,9 +255,11 @@ confirmed 8 tiles loaded with no console errors.
   owner workspace stays clean.
 - `db:reset` requires explicit confirmation and refuses production.
 - The app name comes from `NEXT_PUBLIC_APP_NAME`, default `Lead Finder`.
-- Gemini, xAI Grok and Groq are search planners only. Real leads always come from Overpass
-  or Google Places; the planner schema cannot carry business records.
-- Public Overpass reliability is outside the app's control, so the app retries, falls back
-  to configured mirrors, caches and reports failures honestly instead of inventing data.
+- Gemini, xAI Grok and Groq are search planners only. Real leads always come from the
+  Nominatim POI index, Overpass or Google Places; the planner schema cannot carry business
+  records.
+- Public Overpass reliability is outside the app's control, so discovery reads the
+  Nominatim POI index first, uses Overpass only as a backup, caches and reports failures
+  honestly instead of inventing data.
 - `leaflet` is the only new runtime dependency for maps; tiles come directly from
   OpenStreetMap with attribution, and geocoding uses Nominatim with a throttled proxy.

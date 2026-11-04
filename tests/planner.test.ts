@@ -61,10 +61,19 @@ describe("parsePlannerOutput", () => {
     expect(plan.notes.join(" ")).toMatch(/Google Places is not configured/i);
   });
 
-  it("asks for a location instead of inventing one", () => {
+  it("accepts a city without a country and records a note", () => {
+    const plan = parsePlannerOutput(
+      JSON.stringify({ city: "Lisbon", categories: ["dentist"], limit: 50 }),
+    );
+    expect(plan.city).toBe("Lisbon");
+    expect(plan.country).toBe("");
+    expect(plan.notes.join(" ")).toMatch(/no country given/i);
+  });
+
+  it("asks for a city instead of inventing one", () => {
     expect(() =>
       parsePlannerOutput(JSON.stringify({ city: "", country: "", categories: ["dentist"] })),
-    ).toThrow(/missing a location/i);
+    ).toThrow(/missing a city/i);
   });
 
   it("rejects a plan with no supported categories", () => {
@@ -200,6 +209,32 @@ describe("planDiscovery provider calls", () => {
     };
     expect(body.response_format?.type).toBe("json_object");
     expect(body.model).toBe(env.groq.model);
+  });
+
+  it("auto mode stops on an invalid plan instead of trying more providers", async () => {
+    (env.gemini as { apiKey: string }).apiKey = "test-gemini";
+    (env.groq as { apiKey: string }).apiKey = "test-groq";
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({ city: "", country: "", categories: ["dentist"] }),
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(planDiscovery({ prompt: "dentists nearby", planner: "auto" })).rejects.toThrow(
+      /missing a city/i,
+    );
+    // Groq is first; the 400 stops the chain before Gemini is called.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("auto mode falls back to the next configured planner", async () => {

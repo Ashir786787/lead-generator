@@ -60,6 +60,7 @@ interface PlannerStatus {
 
 interface DiscoveryResult {
   provider: ProviderId;
+  via: "overpass" | "nominatim" | null;
   found: number;
   importJobId: string | null;
   counts: {
@@ -118,6 +119,19 @@ interface RunOverrides {
   limit: number;
 }
 
+interface ChatEntry {
+  id: string;
+  prompt: string;
+  plan: DiscoveryPlan | null;
+  error: string | null;
+}
+
+const CHAT_EXAMPLES = [
+  "Dentists in Lisbon, Portugal",
+  "Cafes in Berlin",
+  "Gyms in Karachi, Pakistan",
+];
+
 export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
   const router = useRouter();
   const queryClient = useQueryClient();
@@ -133,7 +147,7 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
   const [prompt, setPrompt] = React.useState("");
   const [planner, setPlanner] = React.useState<PlannerChoice>("auto");
   const [planning, setPlanning] = React.useState(false);
-  const [plan, setPlan] = React.useState<DiscoveryPlan | null>(null);
+  const [chat, setChat] = React.useState<ChatEntry[]>([]);
 
   const [mapCenter, setMapCenter] = React.useState<{ lat: number; lng: number } | null>(null);
   const [mapBounds, setMapBounds] = React.useState<DiscoveryMapBounds | null>(null);
@@ -176,13 +190,15 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
     areaCountry = country,
     options: { silent?: boolean } = {},
   ) {
-    if (!areaCity.trim() || !areaCountry.trim()) {
-      toast.error("Enter both a city and a country first.");
+    if (!areaCity.trim()) {
+      toast.error("Enter a city first.");
       return;
     }
     setLocating(true);
     try {
-      const query = `${areaCity.trim()}, ${areaCountry.trim()}`;
+      const query = areaCountry.trim()
+        ? `${areaCity.trim()}, ${areaCountry.trim()}`
+        : areaCity.trim();
       const response = await apiFetch<{ results: GeocodeHit[]; attribution: string }>(
         `/api/discovery/geocode?q=${encodeURIComponent(query)}`,
       );
@@ -196,7 +212,7 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
       setMapMarkers([]);
       setMapBounds(best.bounds);
       setMapCenter({ lat: best.lat, lng: best.lng });
-      setMapLabel(`${best.city ?? areaCity}, ${best.country ?? areaCountry}`);
+      setMapLabel(`${best.city ?? areaCity}, ${best.country ?? areaCountry}`.replace(/,\s*$/, ""));
       if (!options.silent) toast.success(`Map centred on ${best.displayName}.`);
     } catch (error) {
       if (!options.silent) toast.error(errorMessage(error));
@@ -206,26 +222,35 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
   }
 
   async function planSearch() {
-    if (prompt.trim().length < 3) {
+    const text = prompt.trim();
+    if (text.length < 3) {
       toast.error("Describe the businesses and location you want.");
       return;
     }
+    const entryId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setChat((current) => [...current, { id: entryId, prompt: text, plan: null, error: null }]);
+    setPrompt("");
     setPlanning(true);
-    setPlan(null);
     try {
       const response = await apiFetch<{ plan: DiscoveryPlan; planners: PlannerStatus[] }>(
         "/api/discovery/plan",
         {
           method: "POST",
-          body: JSON.stringify({ prompt: prompt.trim(), planner }),
+          body: JSON.stringify({ prompt: text, planner }),
         },
       );
-      setPlan(response.plan);
+      setChat((current) =>
+        current.map((entry) => (entry.id === entryId ? { ...entry, plan: response.plan } : entry)),
+      );
       toast.success(
         `Plan ready: ${response.plan.categories.length} categor${response.plan.categories.length === 1 ? "y" : "ies"} in ${response.plan.city}.`,
       );
     } catch (error) {
-      toast.error(errorMessage(error));
+      const message = errorMessage(error);
+      setChat((current) =>
+        current.map((entry) => (entry.id === entryId ? { ...entry, error: message } : entry)),
+      );
+      toast.error(message);
     } finally {
       setPlanning(false);
     }
@@ -267,8 +292,8 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
       toast.error("Google Places is not configured. Add GOOGLE_PLACES_API_KEY to enable it.");
       return;
     }
-    if (!request.city || !request.country) {
-      toast.error("Enter both a city and a country.");
+    if (!request.city) {
+      toast.error("Enter a city.");
       return;
     }
     if (!request.categories.length) {
@@ -293,7 +318,7 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
           lat: response.result.mapped[0]?.lat ?? 0,
           lng: response.result.mapped[0]?.lng ?? 0,
         });
-        setMapLabel(`${request.city}, ${request.country}`);
+        setMapLabel(`${request.city}, ${request.country}`.replace(/,\s*$/, ""));
       }
       toast.success(response.result.message);
       await queryClient.invalidateQueries({ queryKey: ["discovery"] });
@@ -331,8 +356,8 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1.55fr)_minmax(0,1fr)]">
         <div className="space-y-5">
           <SectionCard
-            title="Plan with AI"
-            description="Optional. Describe the businesses and place in plain language; the planner turns it into filters for a real source."
+            title="AI search assistant"
+            description="Chat in plain language. The assistant only plans filters; every business still comes from a live source."
             actions={
               <Badge variant={anyPlannerAvailable ? "success" : "muted"}>
                 <Sparkles className="size-3" />
@@ -341,9 +366,71 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
             }
           >
             <div className="space-y-3">
+              {chat.length ? (
+                <div className="max-h-[460px] space-y-4 overflow-y-auto rounded-xl border border-border/70 bg-muted/20 p-3">
+                  {chat.map((entry, index) => (
+                    <div key={entry.id} className="space-y-2">
+                      <div className="flex justify-end">
+                        <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-primary px-3 py-2 text-sm leading-relaxed text-primary-foreground">
+                          {entry.prompt}
+                        </div>
+                      </div>
+                      <div className="flex items-start gap-2">
+                        <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+                          <Sparkles className="size-3" />
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          {entry.plan ? (
+                            <PlanPreview plan={entry.plan} running={running} onApply={applyPlan} />
+                          ) : entry.error ? (
+                            <div className="rounded-2xl rounded-tl-sm border border-danger/25 bg-danger-soft px-3 py-2 text-sm text-danger">
+                              {entry.error}
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-2 rounded-2xl rounded-tl-sm border border-border/70 bg-card px-3 py-2 text-sm text-muted-foreground">
+                              <Loader2 className="size-3.5 animate-spin" />
+                              {planning && index === chat.length - 1
+                                ? "Planning the search filters…"
+                                : "No plan was returned."}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="rounded-xl border border-dashed border-border bg-muted/20 p-4">
+                  <p className="text-sm font-medium">Ask for the leads you want.</p>
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                    For example: “Family dentists and orthodontists in Lisbon, Portugal — about 50 leads.”
+                  </p>
+                  <div className="mt-3 flex flex-wrap gap-1.5">
+                    {CHAT_EXAMPLES.map((example) => (
+                      <button
+                        key={example}
+                        type="button"
+                        onClick={() => setPrompt(example)}
+                        className="rounded-full border border-border bg-card px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+                      >
+                        {example}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <Textarea
                 value={prompt}
                 onChange={(event) => setPrompt(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    if (!planning && anyPlannerAvailable && prompt.trim().length >= 3) {
+                      void planSearch();
+                    }
+                  }
+                }}
                 placeholder={'e.g. "Family dentists and orthodontists in Lisbon, Portugal — about 50 leads."'}
                 maxLength={600}
                 rows={3}
@@ -371,7 +458,7 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                   disabled={planning || !anyPlannerAvailable || prompt.trim().length < 3}
                 >
                   {planning ? <Loader2 className="animate-spin" /> : <Wand2 />}
-                  Plan search
+                  Send
                 </Button>
               </div>
 
@@ -392,12 +479,10 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                 </p>
               ) : (
                 <p className="text-xs leading-relaxed text-muted-foreground">
-                  The planner receives your description only and returns location, categories and a result limit. It
-                  cannot return businesses, phone numbers, emails or websites — those always come from the live source.
+                  Press Enter to send, Shift+Enter for a new line. The assistant cannot return businesses, phone
+                  numbers, emails or websites — those always come from the live source.
                 </p>
               )}
-
-              {plan ? <PlanPreview plan={plan} running={running} onApply={applyPlan} /> : null}
             </div>
           </SectionCard>
 
@@ -516,7 +601,7 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                   type="button"
                   variant="outline"
                   onClick={() => void previewArea()}
-                  disabled={locating || !city.trim() || !country.trim()}
+                  disabled={locating || !city.trim()}
                 >
                   {locating ? <Loader2 className="animate-spin" /> : <MapPin />} Show area on map
                 </Button>
@@ -573,6 +658,11 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                 ) : null
               }
             >
+              {result.via === "nominatim" ? (
+                <p className="mb-3 rounded-lg border border-border/70 bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+                  Source: OpenStreetMap POI index (Nominatim) — live OpenStreetMap data, not generated.
+                </p>
+              ) : null}
               {result.sample.length ? (
                 <>
                   <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
@@ -750,7 +840,7 @@ function PlanPreview({
         <div className="min-w-0">
           <p className="flex items-center gap-1.5 text-sm font-semibold">
             <MapPin className="size-3.5 text-primary" />
-            {plan.city}, {plan.country}
+            {[plan.city, plan.country].filter(Boolean).join(", ")}
           </p>
           <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{plan.reasoning}</p>
         </div>
