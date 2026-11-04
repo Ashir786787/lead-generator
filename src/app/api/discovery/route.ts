@@ -12,6 +12,7 @@ import {
 import { CATEGORY_KEYS } from "@/lib/score/types";
 import { checkRateLimit } from "@/lib/api/rate-limit";
 import { listImports } from "@/lib/import/service";
+import { plannerStatuses } from "@/lib/discovery/ai";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -33,6 +34,7 @@ export async function GET() {
     const [saved, imports] = await Promise.all([listSavedSearches(ctx), listImports(ctx)]);
     return NextResponse.json({
       providers: providerStatuses(),
+      planners: plannerStatuses(),
       savedSearches: saved,
       recent: imports.filter((item) => item.origin === "discovery").slice(0, 8),
       categories: CATEGORY_KEYS,

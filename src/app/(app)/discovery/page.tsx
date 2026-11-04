@@ -5,6 +5,7 @@ import {
   providerStatuses,
 } from "@/lib/discovery/service";
 import { DiscoveryView } from "@/components/discovery/discovery-view";
+import { plannerStatuses } from "@/lib/discovery/ai";
 
 export const dynamic = "force-dynamic";
 
@@ -15,6 +16,7 @@ export default async function DiscoveryPage() {
     <DiscoveryView
       initial={{
         providers: providerStatuses(),
+        planners: plannerStatuses(),
         savedSearches,
         recent: imports.filter((item) => item.origin === "discovery").slice(0, 8),
       }}

@@ -10,6 +10,13 @@ function num(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function list(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? "development",
   isProduction: process.env.NODE_ENV === "production",
@@ -46,11 +53,28 @@ export const env = {
   },
   overpass: {
     endpoint: process.env.OVERPASS_ENDPOINT ?? "https://overpass-api.de/api/interpreter",
+    endpoints: list(process.env.OVERPASS_ENDPOINTS),
     cacheMinutes: num(process.env.OVERPASS_CACHE_MINUTES, 60),
+    timeoutMs: num(process.env.OVERPASS_TIMEOUT_MS, 55_000),
+    retries: num(process.env.OVERPASS_RETRIES, 2),
   },
   googlePlaces: {
     apiKey: process.env.GOOGLE_PLACES_API_KEY ?? "",
     dailyBudget: num(process.env.GOOGLE_PLACES_DAILY_BUDGET, 100),
+  },
+  gemini: {
+    apiKey: process.env.GEMINI_API_KEY ?? "",
+    model: process.env.GEMINI_MODEL ?? "gemini-2.5-flash",
+  },
+  grok: {
+    apiKey: process.env.GROK_API_KEY ?? "",
+    model: process.env.GROK_MODEL ?? "grok-4",
+    baseUrl: process.env.GROK_BASE_URL ?? "https://api.x.ai/v1",
+  },
+  geocode: {
+    endpoint: process.env.GEOCODE_ENDPOINT ?? "https://nominatim.openstreetmap.org/search",
+    cacheMinutes: num(process.env.GEOCODE_CACHE_MINUTES, 1440),
+    userAgent: process.env.GEOCODE_USER_AGENT ?? process.env.SCAN_USER_AGENT ?? "LeadFinderBot/1.0",
   },
   pgBossSchema: process.env.PG_BOSS_SCHEMA ?? "pgboss",
   logLevel: process.env.LOG_LEVEL ?? "info",

@@ -5,6 +5,8 @@ test.describe("discovery", () => {
     await page.goto("/discovery");
     await expect(page.getByRole("heading", { name: "Discovery", exact: true })).toBeVisible();
     await expect(page.getByText("Search a real source")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Plan with AI", exact: true })).toBeVisible();
+    await expect(page.getByText(/AI only plans the search/i).first()).toBeVisible();
     await expect(page.getByText("OpenStreetMap", { exact: false }).first()).toBeVisible();
     await expect(page.getByText("Google Places", { exact: false }).first()).toBeVisible();
 

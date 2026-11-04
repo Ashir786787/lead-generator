@@ -190,3 +190,15 @@ body {
     scroll-behavior: auto;
   }
 }
+
+/* Keep Leaflet panes below app chrome such as sticky headers and dialogs. */
+.leaflet-container {
+  isolation: isolate;
+  z-index: 0;
+  font: inherit;
+  background: var(--muted);
+}
+
+.leaflet-container .leaflet-control-attribution {
+  font-size: 10px;
+}

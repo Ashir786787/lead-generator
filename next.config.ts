@@ -15,7 +15,7 @@ const nextConfig: NextConfig = {
       // React's dev build relies on eval() for debugging, so only allow it in development.
       isDev ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'" : "script-src 'self' 'unsafe-inline'",
       "style-src 'self' 'unsafe-inline'",
-      "img-src 'self' data: blob:",
+      "img-src 'self' data: blob: https://*.tile.openstreetmap.org https://tile.openstreetmap.org",
       "font-src 'self' data:",
       "connect-src 'self'",
       "frame-ancestors 'none'",

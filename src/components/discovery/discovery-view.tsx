@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  AlertTriangle,
   CheckCircle2,
   Compass,
   Database,
@@ -14,6 +15,7 @@ import {
   MapPin,
   Play,
   Search,
+  Sparkles,
   Trash2,
   Wand2,
 } from "lucide-react";
@@ -30,17 +32,34 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  DiscoveryMap,
+  type DiscoveryMapBounds,
+  type DiscoveryMapMarker,
+} from "@/components/discovery/discovery-map";
+
+type ProviderId = "osm" | "google_places";
+type PlannerChoice = "auto" | "gemini" | "grok";
 
 interface ProviderStatus {
-  id: "osm" | "google_places";
+  id: ProviderId;
   label: string;
   available: boolean;
   detail: string;
   attribution: string;
 }
 
+interface PlannerStatus {
+  id: "gemini" | "grok";
+  label: string;
+  available: boolean;
+  model: string;
+  detail: string;
+}
+
 interface DiscoveryResult {
-  provider: "osm" | "google_places";
+  provider: ProviderId;
   found: number;
   importJobId: string | null;
   counts: {
@@ -52,20 +71,57 @@ interface DiscoveryResult {
     skippedCount: number;
     errorCount: number;
   } | null;
-  sample: Array<{ name: string; city: string | null; website: string | null }>;
+  sample: Array<{
+    name: string;
+    city: string | null;
+    website: string | null;
+    lat: number | null;
+    lng: number | null;
+  }>;
+  mapped: DiscoveryMapMarker[];
   message: string;
+}
+
+interface DiscoveryPlan {
+  planner: "gemini" | "grok";
+  model: string;
+  provider: ProviderId;
+  country: string;
+  city: string;
+  categories: string[];
+  limit: number;
+  reasoning: string;
+  notes: string[];
 }
 
 interface DiscoveryPayload {
   providers: ProviderStatus[];
+  planners: PlannerStatus[];
   savedSearches: SavedSearch[];
   recent: ImportSummary[];
+}
+
+interface GeocodeHit {
+  displayName: string;
+  city: string | null;
+  country: string | null;
+  lat: number;
+  lng: number;
+  bounds: DiscoveryMapBounds | null;
+}
+
+interface RunOverrides {
+  provider: ProviderId;
+  country: string;
+  city: string;
+  categories: string[];
+  limit: number;
 }
 
 export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
   const router = useRouter();
   const queryClient = useQueryClient();
-  const [provider, setProvider] = React.useState<"osm" | "google_places">("osm");
+  const [provider, setProvider] = React.useState<ProviderId>("osm");
   const [country, setCountry] = React.useState("");
   const [city, setCity] = React.useState("");
   const [categories, setCategories] = React.useState<string[]>([]);
@@ -74,6 +130,17 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
   const [running, setRunning] = React.useState(false);
   const [result, setResult] = React.useState<DiscoveryResult | null>(null);
 
+  const [prompt, setPrompt] = React.useState("");
+  const [planner, setPlanner] = React.useState<PlannerChoice>("auto");
+  const [planning, setPlanning] = React.useState(false);
+  const [plan, setPlan] = React.useState<DiscoveryPlan | null>(null);
+
+  const [mapCenter, setMapCenter] = React.useState<{ lat: number; lng: number } | null>(null);
+  const [mapBounds, setMapBounds] = React.useState<DiscoveryMapBounds | null>(null);
+  const [mapMarkers, setMapMarkers] = React.useState<DiscoveryMapMarker[]>([]);
+  const [mapLabel, setMapLabel] = React.useState("");
+  const [locating, setLocating] = React.useState(false);
+
   const dataQuery = useQuery({
     queryKey: ["discovery"],
     queryFn: () => apiFetch<DiscoveryPayload>("/api/discovery"),
@@ -81,6 +148,8 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
   });
 
   const data = dataQuery.data;
+  const planners = data.planners ?? [];
+  const anyPlannerAvailable = planners.some((item) => item.available);
 
   function toggleCategory(key: string) {
     setCategories((current) =>
@@ -102,16 +171,107 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  async function run() {
-    if (provider === "google_places" && !data.providers.find((item) => item.id === "google_places")?.available) {
+  async function previewArea(
+    areaCity = city,
+    areaCountry = country,
+    options: { silent?: boolean } = {},
+  ) {
+    if (!areaCity.trim() || !areaCountry.trim()) {
+      toast.error("Enter both a city and a country first.");
+      return;
+    }
+    setLocating(true);
+    try {
+      const query = `${areaCity.trim()}, ${areaCountry.trim()}`;
+      const response = await apiFetch<{ results: GeocodeHit[]; attribution: string }>(
+        `/api/discovery/geocode?q=${encodeURIComponent(query)}`,
+      );
+      const best = response.results[0];
+      if (!best) {
+        if (!options.silent) {
+          toast.info("That place could not be found on OpenStreetMap. Check the spelling.");
+        }
+        return;
+      }
+      setMapMarkers([]);
+      setMapBounds(best.bounds);
+      setMapCenter({ lat: best.lat, lng: best.lng });
+      setMapLabel(`${best.city ?? areaCity}, ${best.country ?? areaCountry}`);
+      if (!options.silent) toast.success(`Map centred on ${best.displayName}.`);
+    } catch (error) {
+      if (!options.silent) toast.error(errorMessage(error));
+    } finally {
+      setLocating(false);
+    }
+  }
+
+  async function planSearch() {
+    if (prompt.trim().length < 3) {
+      toast.error("Describe the businesses and location you want.");
+      return;
+    }
+    setPlanning(true);
+    setPlan(null);
+    try {
+      const response = await apiFetch<{ plan: DiscoveryPlan; planners: PlannerStatus[] }>(
+        "/api/discovery/plan",
+        {
+          method: "POST",
+          body: JSON.stringify({ prompt: prompt.trim(), planner }),
+        },
+      );
+      setPlan(response.plan);
+      toast.success(
+        `Plan ready: ${response.plan.categories.length} categor${response.plan.categories.length === 1 ? "y" : "ies"} in ${response.plan.city}.`,
+      );
+    } catch (error) {
+      toast.error(errorMessage(error));
+    } finally {
+      setPlanning(false);
+    }
+  }
+
+  function applyPlan(next: DiscoveryPlan, runNow: boolean) {
+    setProvider(next.provider);
+    setCountry(next.country);
+    setCity(next.city);
+    setCategories(next.categories);
+    setLimit(String(next.limit));
+    setResult(null);
+    if (runNow) {
+      void run({
+        provider: next.provider,
+        country: next.country,
+        city: next.city,
+        categories: next.categories,
+        limit: next.limit,
+      });
+    } else {
+      toast.success("Plan applied to the form. Review the filters, then run discovery.");
+      void previewArea(next.city, next.country, { silent: true });
+    }
+  }
+
+  async function run(overrides?: RunOverrides) {
+    const request: RunOverrides = overrides ?? {
+      provider,
+      country: country.trim(),
+      city: city.trim(),
+      categories,
+      limit: Number(limit) || 50,
+    };
+    if (
+      request.provider === "google_places" &&
+      !data.providers.find((item) => item.id === "google_places")?.available
+    ) {
       toast.error("Google Places is not configured. Add GOOGLE_PLACES_API_KEY to enable it.");
       return;
     }
-    if (!city.trim() || !country.trim()) {
+    if (!request.city || !request.country) {
       toast.error("Enter both a city and a country.");
       return;
     }
-    if (!categories.length) {
+    if (!request.categories.length) {
       toast.error("Choose at least one category.");
       return;
     }
@@ -121,15 +281,20 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
       const response = await apiFetch<{ result: DiscoveryResult }>("/api/discovery", {
         method: "POST",
         body: JSON.stringify({
-          provider,
-          country: country.trim(),
-          city: city.trim(),
-          categories,
-          limit: Number(limit) || 50,
+          ...request,
           saveSearch,
         }),
       });
       setResult(response.result);
+      if (response.result.mapped.length) {
+        setMapMarkers(response.result.mapped);
+        setMapBounds(null);
+        setMapCenter({
+          lat: response.result.mapped[0]?.lat ?? 0,
+          lng: response.result.mapped[0]?.lng ?? 0,
+        });
+        setMapLabel(`${request.city}, ${request.country}`);
+      }
       toast.success(response.result.message);
       await queryClient.invalidateQueries({ queryKey: ["discovery"] });
       await queryClient.invalidateQueries({ queryKey: ["imports"] });
@@ -151,16 +316,90 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
     }
   }
 
+  const mappedLabel = result?.mapped.length
+    ? `${result.mapped.length} of ${result.found} results have coordinates from the source.`
+    : "Approximate search area. Results will appear here when the source returns coordinates.";
+
   return (
     <div className="animate-rise">
       <PageHeader
         eyebrow="Live sources"
         title="Discovery"
-        description="Find real businesses from public sources and add them to this workspace. Every result keeps its attribution."
+        description="Describe who you want, preview the area on a real map, and import live businesses from public sources. AI only plans the search — it never invents leads."
       />
 
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1.55fr)_minmax(0,1fr)]">
         <div className="space-y-5">
+          <SectionCard
+            title="Plan with AI"
+            description="Optional. Describe the businesses and place in plain language; the planner turns it into filters for a real source."
+            actions={
+              <Badge variant={anyPlannerAvailable ? "success" : "muted"}>
+                <Sparkles className="size-3" />
+                {anyPlannerAvailable ? "Ready" : "Not configured"}
+              </Badge>
+            }
+          >
+            <div className="space-y-3">
+              <Textarea
+                value={prompt}
+                onChange={(event) => setPrompt(event.target.value)}
+                placeholder={'e.g. "Family dentists and orthodontists in Lisbon, Portugal — about 50 leads."'}
+                maxLength={600}
+                rows={3}
+                aria-label="Describe the businesses you want to find"
+              />
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                <Field label="Planner" htmlFor="discovery-planner" className="sm:max-w-[220px] sm:flex-1">
+                  <Select
+                    id="discovery-planner"
+                    value={planner}
+                    onChange={(event) => setPlanner(event.target.value as PlannerChoice)}
+                  >
+                    <option value="auto">Auto (first configured)</option>
+                    {planners.map((item) => (
+                      <option key={item.id} value={item.id} disabled={!item.available}>
+                        {item.label}
+                        {item.available ? "" : " — add key"}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+                <Button
+                  type="button"
+                  onClick={() => void planSearch()}
+                  disabled={planning || !anyPlannerAvailable || prompt.trim().length < 3}
+                >
+                  {planning ? <Loader2 className="animate-spin" /> : <Wand2 />}
+                  Plan search
+                </Button>
+              </div>
+
+              <div className="flex flex-wrap gap-1.5">
+                {planners.map((item) => (
+                  <Badge key={item.id} variant={item.available ? "success" : "muted"}>
+                    {item.label}: {item.available ? item.model : "not configured"}
+                  </Badge>
+                ))}
+              </div>
+
+              {!anyPlannerAvailable ? (
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  Add <code className="rounded bg-muted px-1 py-0.5">GEMINI_API_KEY</code> or{" "}
+                  <code className="rounded bg-muted px-1 py-0.5">GROK_API_KEY</code> to <code>.env</code> and restart
+                  to enable AI planning. The manual form below still works with OpenStreetMap only.
+                </p>
+              ) : (
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  The planner receives your description only and returns location, categories and a result limit. It
+                  cannot return businesses, phone numbers, emails or websites — those always come from the live source.
+                </p>
+              )}
+
+              {plan ? <PlanPreview plan={plan} running={running} onApply={applyPlan} /> : null}
+            </div>
+          </SectionCard>
+
           <SectionCard
             title="Search a real source"
             description="Keep searches small and targeted. OpenStreetMap is a shared community service."
@@ -188,7 +427,9 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                           {item.available ? "Available" : "Unavailable"}
                         </Badge>
                       </span>
-                      <span className="mt-1.5 block text-xs leading-relaxed text-muted-foreground">{item.detail}</span>
+                      <span className="mt-1.5 block text-xs leading-relaxed text-muted-foreground">
+                        {item.detail}
+                      </span>
                       <span className="mt-1.5 block text-[10px] text-muted-foreground">{item.attribution}</span>
                     </button>
                   );
@@ -243,7 +484,11 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
               </div>
 
               <div className="grid gap-3 sm:grid-cols-2">
-                <Field label="Maximum results" htmlFor="discovery-limit" hint="Smaller searches are kinder to shared services.">
+                <Field
+                  label="Maximum results"
+                  htmlFor="discovery-limit"
+                  hint="Smaller searches are kinder to shared services."
+                >
                   <Select id="discovery-limit" value={limit} onChange={(event) => setLimit(event.target.value)}>
                     <option value="20">20 businesses</option>
                     <option value="50">50 businesses</option>
@@ -266,12 +511,54 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                 <Button type="button" onClick={() => void run()} disabled={running}>
                   {running ? <Loader2 className="animate-spin" /> : <Search />} Run discovery
                 </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => void previewArea()}
+                  disabled={locating || !city.trim() || !country.trim()}
+                >
+                  {locating ? <Loader2 className="animate-spin" /> : <MapPin />} Show area on map
+                </Button>
                 <p className="text-xs text-muted-foreground">
-                  Results are imported through the same dedupe and validation pipeline as uploads.
+                  Results are imported through the same dedupe and validation pipeline as uploads. OpenStreetMap can
+                  take 30–60 seconds when the shared service is busy.
                 </p>
               </div>
             </div>
           </SectionCard>
+
+          {mapCenter || mapBounds || mapMarkers.length ? (
+            <SectionCard
+              title={mapMarkers.length ? "Results on the map" : "Search area"}
+              description={mapMarkers.length ? mappedLabel : "Approximate area from OpenStreetMap. Zoom and pan to inspect it."}
+              actions={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setMapCenter(null);
+                    setMapBounds(null);
+                    setMapMarkers([]);
+                    setMapLabel("");
+                  }}
+                >
+                  Hide map
+                </Button>
+              }
+            >
+              <DiscoveryMap
+                center={mapCenter}
+                bounds={mapBounds}
+                markers={mapMarkers}
+                label={`Map for ${mapLabel || city || "search area"}`}
+              />
+              <p className="mt-2 text-xs text-muted-foreground">
+                Map data © OpenStreetMap contributors. Positions come from the selected source and are not verified
+                addresses.
+              </p>
+            </SectionCard>
+          ) : null}
 
           {result ? (
             <SectionCard
@@ -295,7 +582,10 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                   </div>
                   <ul className="divide-y divide-border/70">
                     {result.sample.map((item, index) => (
-                      <li key={`${item.name}-${index}`} className="flex items-center gap-3 py-2 text-sm first:pt-0 last:pb-0">
+                      <li
+                        key={`${item.name}-${index}`}
+                        className="flex items-center gap-3 py-2 text-sm first:pt-0 last:pb-0"
+                      >
                         <Globe2 className="size-3.5 shrink-0 text-muted-foreground" />
                         <span className="min-w-0 flex-1 truncate font-medium">{item.name}</span>
                         <span className="shrink-0 text-xs text-muted-foreground">
@@ -324,7 +614,8 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
               <p className="mt-2 text-sm font-medium">Live results, not sample data</p>
               <p className="mx-auto mt-1 max-w-lg text-sm leading-relaxed text-muted-foreground">
                 Discovery returns whatever the public source actually has for your query. If a source is unavailable,
-                it stays unavailable instead of showing invented businesses.
+                it stays unavailable instead of showing invented businesses. AI plans filters; it is never treated as a
+                business database.
               </p>
             </div>
           )}
@@ -358,7 +649,13 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                         </div>
                       </div>
                       <div className="flex shrink-0 items-center gap-1">
-                        <Button type="button" size="iconSm" variant="outline" onClick={() => loadSaved(search)} aria-label="Use saved search">
+                        <Button
+                          type="button"
+                          size="iconSm"
+                          variant="outline"
+                          onClick={() => loadSaved(search)}
+                          aria-label="Use saved search"
+                        >
                           <Play />
                         </Button>
                         <Button
@@ -415,11 +712,15 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
             <ul className="mt-2 space-y-1.5 text-xs leading-relaxed text-muted-foreground">
               <li className="flex items-start gap-1.5">
                 <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-success" /> OpenStreetMap data © OpenStreetMap
-                contributors, available under the ODbL.
+                contributors, available under the ODbL. Geocoding uses Nominatim.
               </li>
               <li className="flex items-start gap-1.5">
-                <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-success" /> Searches are rate-limited to protect
-                shared services.
+                <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-success" /> Gemini and Grok only turn your words
+                into search filters. They are not lead sources and cannot add businesses.
+              </li>
+              <li className="flex items-start gap-1.5">
+                <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-success" /> Searches and geocoding are rate-limited
+                to protect shared services.
               </li>
               <li className="flex items-start gap-1.5">
                 <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-success" /> Respect each source&apos;s terms and
@@ -429,6 +730,64 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
           </div>
         </aside>
       </div>
+    </div>
+  );
+}
+
+function PlanPreview({
+  plan,
+  running,
+  onApply,
+}: {
+  plan: DiscoveryPlan;
+  running: boolean;
+  onApply: (plan: DiscoveryPlan, runNow: boolean) => void;
+}) {
+  return (
+    <div className="rounded-lg border border-primary/30 bg-primary/5 p-3">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="flex items-center gap-1.5 text-sm font-semibold">
+            <MapPin className="size-3.5 text-primary" />
+            {plan.city}, {plan.country}
+          </p>
+          <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{plan.reasoning}</p>
+        </div>
+        <Badge variant="outline">
+          {plan.planner} · {plan.model}
+        </Badge>
+      </div>
+      <div className="mt-2 flex flex-wrap gap-1">
+        {plan.categories.map((category) => (
+          <Badge key={category} variant="secondary">
+            {CATEGORY_OPTIONS.find((option) => option.key === category)?.label ?? category}
+          </Badge>
+        ))}
+        <Badge variant="outline">
+          {plan.provider === "osm" ? "OpenStreetMap" : "Google Places"} · up to {plan.limit}
+        </Badge>
+      </div>
+      {plan.notes.length ? (
+        <ul className="mt-2 space-y-1 text-xs text-warning">
+          {plan.notes.map((note) => (
+            <li key={note} className="flex items-start gap-1.5">
+              <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+              {note}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Button type="button" size="sm" variant="outline" onClick={() => onApply(plan, false)} disabled={running}>
+          Apply to form
+        </Button>
+        <Button type="button" size="sm" onClick={() => onApply(plan, true)} disabled={running}>
+          {running ? <Loader2 className="animate-spin" /> : <Search />} Apply &amp; run
+        </Button>
+      </div>
+      <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+        This is a plan, not a result list. The app will query the selected live source and import only real records.
+      </p>
     </div>
   );
 }
