@@ -64,12 +64,18 @@ export const env = {
   },
   gemini: {
     apiKey: process.env.GEMINI_API_KEY ?? "",
-    model: process.env.GEMINI_MODEL ?? "gemini-2.5-flash",
+    // Model names churn quickly; the default is a currently available Flash model.
+    model: process.env.GEMINI_MODEL ?? "gemini-3.1-flash-lite",
   },
   grok: {
     apiKey: process.env.GROK_API_KEY ?? "",
     model: process.env.GROK_MODEL ?? "grok-4",
     baseUrl: process.env.GROK_BASE_URL ?? "https://api.x.ai/v1",
+  },
+  groq: {
+    apiKey: process.env.GROQ_API_KEY ?? "",
+    model: process.env.GROQ_MODEL ?? "qwen/qwen3.8-27b",
+    baseUrl: process.env.GROQ_BASE_URL ?? "https://api.groq.com/openai/v1",
   },
   geocode: {
     endpoint: process.env.GEOCODE_ENDPOINT ?? "https://nominatim.openstreetmap.org/search",

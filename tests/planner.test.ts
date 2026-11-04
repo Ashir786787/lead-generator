@@ -83,10 +83,11 @@ describe("parsePlannerOutput", () => {
 describe("planner availability", () => {
   it("is honest when no keys are configured", () => {
     const statuses = plannerStatuses();
-    expect(statuses.map((item) => item.id)).toEqual(["gemini", "grok"]);
+    expect(statuses.map((item) => item.id)).toEqual(["gemini", "grok", "groq"]);
     expect(statuses.every((item) => item.available)).toBe(false);
     expect(availablePlanner("auto")).toBeNull();
     expect(availablePlanner("grok")).toBeNull();
+    expect(availablePlanner("groq")).toBeNull();
   });
 });
 
@@ -95,6 +96,7 @@ describe("planDiscovery provider calls", () => {
     vi.unstubAllGlobals();
     (env.gemini as { apiKey: string }).apiKey = "";
     (env.grok as { apiKey: string }).apiKey = "";
+    (env.groq as { apiKey: string }).apiKey = "";
   });
 
   it("sends Gemini a JSON-only plan request and validates the answer", async () => {
@@ -153,6 +155,92 @@ describe("planDiscovery provider calls", () => {
       /not configured/i,
     );
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("calls Groq's OpenAI-compatible endpoint with JSON mode", async () => {
+    (env.groq as { apiKey: string }).apiKey = "test-key";
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  city: "Berlin",
+                  country: "Germany",
+                  categories: ["cafes"],
+                  limit: 20,
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plan = await planDiscovery({ prompt: "cafes in Berlin, Germany", planner: "groq" });
+
+    expect(plan).toMatchObject({
+      planner: "groq",
+      model: env.groq.model,
+      city: "Berlin",
+      country: "Germany",
+      categories: ["cafe"],
+      limit: 20,
+    });
+    const call = fetchMock.mock.calls[0];
+    expect(String(call?.[0])).toContain("api.groq.com/openai/v1/chat/completions");
+    const headers = (call?.[1] as RequestInit | undefined)?.headers as Record<string, string>;
+    expect(headers.Authorization).toMatch(/^Bearer test-key$/);
+    const body = JSON.parse(String((call?.[1] as RequestInit | undefined)?.body)) as {
+      response_format?: { type?: string };
+      model?: string;
+    };
+    expect(body.response_format?.type).toBe("json_object");
+    expect(body.model).toBe(env.groq.model);
+  });
+
+  it("auto mode falls back to the next configured planner", async () => {
+    (env.gemini as { apiKey: string }).apiKey = "test-gemini";
+    (env.groq as { apiKey: string }).apiKey = "test-groq";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { message: "high demand" } }), { status: 503 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        city: "Lisbon",
+                        country: "Portugal",
+                        categories: ["dentist"],
+                        limit: 50,
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plan = await planDiscovery({ prompt: "dentists in Lisbon, Portugal", planner: "auto" });
+
+    expect(plan.planner).toBe("gemini");
+    expect(plan.city).toBe("Lisbon");
+    expect(plan.notes.join(" ")).toMatch(/fell back to Gemini/i);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 

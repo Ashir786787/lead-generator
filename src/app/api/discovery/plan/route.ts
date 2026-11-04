@@ -14,7 +14,7 @@ const planSchema = z.object({
     .trim()
     .min(3, "Describe the businesses and location you want.")
     .max(600, "Keep the request under 600 characters."),
-  planner: z.enum(["auto", "gemini", "grok"]).default("auto"),
+  planner: z.enum(["auto", "gemini", "grok", "groq"]).default("auto"),
 });
 
 export async function POST(request: Request) {

@@ -40,7 +40,7 @@ import {
 } from "@/components/discovery/discovery-map";
 
 type ProviderId = "osm" | "google_places";
-type PlannerChoice = "auto" | "gemini" | "grok";
+type PlannerChoice = "auto" | "gemini" | "grok" | "groq";
 
 interface ProviderStatus {
   id: ProviderId;
@@ -51,7 +51,7 @@ interface ProviderStatus {
 }
 
 interface PlannerStatus {
-  id: "gemini" | "grok";
+  id: "gemini" | "grok" | "groq";
   label: string;
   available: boolean;
   model: string;
@@ -83,7 +83,7 @@ interface DiscoveryResult {
 }
 
 interface DiscoveryPlan {
-  planner: "gemini" | "grok";
+  planner: "gemini" | "grok" | "groq";
   model: string;
   provider: ProviderId;
   country: string;
@@ -356,7 +356,7 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                     value={planner}
                     onChange={(event) => setPlanner(event.target.value as PlannerChoice)}
                   >
-                    <option value="auto">Auto (first configured)</option>
+                    <option value="auto">Auto (fastest configured)</option>
                     {planners.map((item) => (
                       <option key={item.id} value={item.id} disabled={!item.available}>
                         {item.label}
@@ -385,8 +385,9 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
 
               {!anyPlannerAvailable ? (
                 <p className="text-xs leading-relaxed text-muted-foreground">
-                  Add <code className="rounded bg-muted px-1 py-0.5">GEMINI_API_KEY</code> or{" "}
-                  <code className="rounded bg-muted px-1 py-0.5">GROK_API_KEY</code> to <code>.env</code> and restart
+                  Add <code className="rounded bg-muted px-1 py-0.5">GEMINI_API_KEY</code>,{" "}
+                  <code className="rounded bg-muted px-1 py-0.5">GROK_API_KEY</code> or{" "}
+                  <code className="rounded bg-muted px-1 py-0.5">GROQ_API_KEY</code> to <code>.env</code> and restart
                   to enable AI planning. The manual form below still works with OpenStreetMap only.
                 </p>
               ) : (
@@ -715,8 +716,8 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                 contributors, available under the ODbL. Geocoding uses Nominatim.
               </li>
               <li className="flex items-start gap-1.5">
-                <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-success" /> Gemini and Grok only turn your words
-                into search filters. They are not lead sources and cannot add businesses.
+                <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-success" /> Gemini, Grok and Groq only turn your
+                words into search filters. They are not lead sources and cannot add businesses.
               </li>
               <li className="flex items-start gap-1.5">
                 <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-success" /> Searches and geocoding are rate-limited

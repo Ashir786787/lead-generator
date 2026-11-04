@@ -6,8 +6,14 @@ import { logger } from "@/lib/logger";
 import { CATEGORY_KEYS, type CategoryKey } from "@/lib/score/types";
 import type { DiscoveryProvider } from "@/lib/discovery/service";
 
-export type PlannerProvider = "gemini" | "grok";
+export type PlannerProvider = "gemini" | "grok" | "groq";
 export type PlannerChoice = "auto" | PlannerProvider;
+
+const PLANNER_LABELS: Record<PlannerProvider, string> = {
+  gemini: "Gemini",
+  grok: "Grok",
+  groq: "Groq",
+};
 
 export interface PlannerStatus {
   id: PlannerProvider;
@@ -37,15 +43,37 @@ export function plannerStatuses(): PlannerStatus[] {
         ? `Turns a plain-language request into discovery filters with ${env.grok.model}.`
         : "Add GROK_API_KEY to enable AI planning. Discovery still works without it.",
     },
+    {
+      id: "groq",
+      label: "Groq Cloud",
+      available: Boolean(env.groq.apiKey),
+      model: env.groq.model,
+      detail: env.groq.apiKey
+        ? `Turns a plain-language request into discovery filters with ${env.groq.model}.`
+        : "Add GROQ_API_KEY to enable AI planning. Discovery still works without it.",
+    },
   ];
 }
+
+/** Auto mode prefers the fastest verified planner, then the others. */
+const AUTO_ORDER: PlannerProvider[] = ["groq", "gemini", "grok"];
 
 export function availablePlanner(choice: PlannerChoice): PlannerProvider | null {
   const statuses = plannerStatuses();
   if (choice !== "auto") {
     return statuses.find((item) => item.id === choice && item.available)?.id ?? null;
   }
-  return statuses.find((item) => item.available)?.id ?? null;
+  return configuredPlanners()[0] ?? null;
+}
+
+/** Every configured planner in auto-preference order (Groq, Gemini, Grok). */
+export function configuredPlanners(): PlannerProvider[] {
+  const available = new Set(
+    plannerStatuses()
+      .filter((item) => item.available)
+      .map((item) => item.id),
+  );
+  return AUTO_ORDER.filter((planner) => available.has(planner));
 }
 
 const CATEGORY_ALIASES: Record<string, CategoryKey> = {
@@ -381,21 +409,32 @@ async function callGemini(prompt: string): Promise<PlannerTextResult> {
   }
 }
 
-async function callGrok(prompt: string): Promise<PlannerTextResult> {
-  if (!env.grok.apiKey) {
-    throw conflict("Grok is not configured. Add GROK_API_KEY and restart the app.");
+interface OpenAiCompatibleConfig {
+  label: string;
+  apiKey: string;
+  model: string;
+  baseUrl: string;
+  keyEnv: string;
+}
+
+async function callOpenAiCompatible(
+  config: OpenAiCompatibleConfig,
+  prompt: string,
+): Promise<PlannerTextResult> {
+  if (!config.apiKey) {
+    throw conflict(`${config.label} is not configured. Add ${config.keyEnv} and restart the app.`);
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 25_000);
   try {
-    const response = await fetch(`${env.grok.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${env.grok.apiKey}`,
+        Authorization: `Bearer ${config.apiKey}`,
       },
       body: JSON.stringify({
-        model: env.grok.model,
+        model: config.model,
         temperature: 0.2,
         max_tokens: 800,
         response_format: { type: "json_object" },
@@ -415,15 +454,15 @@ async function callGrok(prompt: string): Promise<PlannerTextResult> {
     };
     if (!response.ok) {
       throw conflict(
-        `Grok returned HTTP ${response.status}: ${payload.error?.message?.slice(0, 160) ?? "request failed"}`,
+        `${config.label} returned HTTP ${response.status}: ${payload.error?.message?.slice(0, 160) ?? "request failed"}`,
       );
     }
     const text = payload.choices?.[0]?.message?.content?.trim() ?? "";
-    if (!text) throw conflict("Grok returned an empty plan. Try rephrasing your request.");
-    return { text, model: env.grok.model };
+    if (!text) throw conflict(`${config.label} returned an empty plan. Try rephrasing your request.`);
+    return { text, model: config.model };
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
-      throw conflict("Grok took too long to respond. Retry in a moment.");
+      throw conflict(`${config.label} took too long to respond. Retry in a moment.`);
     }
     throw error;
   } finally {
@@ -431,10 +470,53 @@ async function callGrok(prompt: string): Promise<PlannerTextResult> {
   }
 }
 
+async function callGrok(prompt: string): Promise<PlannerTextResult> {
+  return callOpenAiCompatible(
+    {
+      label: "Grok",
+      apiKey: env.grok.apiKey,
+      model: env.grok.model,
+      baseUrl: env.grok.baseUrl,
+      keyEnv: "GROK_API_KEY",
+    },
+    prompt,
+  );
+}
+
+async function callGroq(prompt: string): Promise<PlannerTextResult> {
+  return callOpenAiCompatible(
+    {
+      label: "Groq",
+      apiKey: env.groq.apiKey,
+      model: env.groq.model,
+      baseUrl: env.groq.baseUrl,
+      keyEnv: "GROQ_API_KEY",
+    },
+    prompt,
+  );
+}
+
+function callPlanner(planner: PlannerProvider, prompt: string): Promise<PlannerTextResult> {
+  switch (planner) {
+    case "gemini":
+      return callGemini(prompt);
+    case "grok":
+      return callGrok(prompt);
+    case "groq":
+      return callGroq(prompt);
+  }
+}
+
 export interface DiscoveryPlan extends PlannerDraft {
   planner: PlannerProvider;
   model: string;
 }
+
+const PLANNER_KEY_ENV: Record<PlannerProvider, string> = {
+  gemini: "GEMINI_API_KEY",
+  grok: "GROK_API_KEY",
+  groq: "GROQ_API_KEY",
+};
 
 export async function planDiscovery(input: {
   prompt: string;
@@ -444,16 +526,46 @@ export async function planDiscovery(input: {
   if (prompt.length < 3) {
     throw badRequest("Describe the businesses and location you want to search.");
   }
+
+  if (input.planner === "auto") {
+    const candidates = configuredPlanners();
+    if (!candidates.length) {
+      throw conflict(
+        "No AI planner is configured. Add GEMINI_API_KEY, GROK_API_KEY or GROQ_API_KEY. You can still run OpenStreetMap searches without AI.",
+      );
+    }
+    const failures: string[] = [];
+    for (const candidate of candidates) {
+      try {
+        const output = await callPlanner(candidate, prompt);
+        const draft = parsePlannerOutput(output.text);
+        if (failures.length) {
+          draft.notes.unshift(
+            `Fell back to ${PLANNER_LABELS[candidate]} because ${failures.join("; ")}.`,
+          );
+        }
+        logger.info(
+          { planner: candidate, model: output.model, provider: draft.provider },
+          "AI discovery plan created",
+        );
+        return { ...draft, planner: candidate, model: output.model };
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "request failed";
+        failures.push(`${PLANNER_LABELS[candidate]}: ${reason}`);
+        logger.warn({ planner: candidate, reason }, "AI planner failed; trying the next one");
+      }
+    }
+    throw conflict(`Every configured AI planner failed. ${failures.join(" · ")}`);
+  }
+
   const planner = availablePlanner(input.planner);
   if (!planner) {
     throw conflict(
-      input.planner === "auto"
-        ? "No AI planner is configured. Add GEMINI_API_KEY or GROK_API_KEY. You can still run OpenStreetMap searches without AI."
-        : `${input.planner === "gemini" ? "Gemini" : "Grok"} is not configured. Add its API key and restart the app.`,
+      `${PLANNER_LABELS[input.planner]} is not configured. Add ${PLANNER_KEY_ENV[input.planner]} and restart the app.`,
     );
   }
 
-  const output = planner === "gemini" ? await callGemini(prompt) : await callGrok(prompt);
+  const output = await callPlanner(planner, prompt);
   const draft = parsePlannerOutput(output.text);
   logger.info({ planner, model: output.model, provider: draft.provider }, "AI discovery plan created");
   return { ...draft, planner, model: output.model };
