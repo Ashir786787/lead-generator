@@ -105,10 +105,10 @@ limitation affects a user decision, the UI is expected to say so honestly.
 
 ## AI planning and maps
 
-39. **Gemini and Grok are optional planners, not data sources.** They receive the user's
-    description and return only country, city, categories, a limit and a target provider.
-    They cannot add businesses, contacts or websites. Without a key, the planner card says
-    so and manual discovery remains available.
+39. **Gemini, xAI Grok and Groq are optional planners, not data sources.** They receive
+    the user's description and return only country, city, categories, a limit and a target
+    provider. They cannot add businesses, contacts or websites. Without a key, the planner
+    card says so and manual discovery remains available.
 40. **Plans can be imperfect.** The app validates and normalises the model's output
     (category aliases, 1–8 categories, 1–200 results) and rejects missing locations, but a
     plan may still be too broad or miss a niche category. Review the filters before
@@ -127,6 +127,12 @@ limitation affects a user decision, the UI is expected to say so honestly.
 44. **Google Places result caps apply.** Text Search returns at most 20 places per request;
     the app does not paginate for more. Its terms and billing are the key owner's
     responsibility.
+45. **AI model names and availability change.** Gemini retired `gemini-2.5-flash` for new
+    keys during this build, newer Flash models can return 503 under load, and Groq's
+    account-specific model list varies. Defaults are configurable via `GEMINI_MODEL`,
+    `GROK_MODEL` and `GROQ_MODEL`; `auto` falls back to another configured planner and says
+    so in the plan. An explicitly selected planner that fails reports the upstream error
+    rather than silently switching.
 
 ## Product boundary
 

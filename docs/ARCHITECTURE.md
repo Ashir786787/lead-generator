@@ -227,7 +227,7 @@ There is no generated/placeholder provider. If a source fails, the run reports t
 failure; it does not substitute fake businesses. Saved searches let a user repeat a
 query; runs are recorded and marked.
 
-### AI search planner (Gemini / Grok)
+### AI search planner (Gemini / Grok / Groq)
 
 `POST /api/discovery/plan` turns a plain-language request into validated filters:
 country, city, 1-8 category keys, a result limit and a target provider. The model
@@ -236,10 +236,15 @@ a data source: the response schema has no fields for business names, addresses, 
 emails or websites, and the app rejects anything outside the filter shape. The resulting
 filters must still be run through Overpass or Google Places.
 
-Gemini uses `GEMINI_MODEL` (default `gemini-2.5-flash`). Grok uses the OpenAI-compatible
-`GROK_BASE_URL` (default `https://api.x.ai/v1`) and `GROK_MODEL` (default `grok-4`).
-`auto` picks the first configured planner. Missing keys produce an honest unavailable
-state; manual discovery keeps working without AI.
+Gemini uses `GEMINI_MODEL` (default `gemini-3.1-flash-lite`). xAI Grok uses the
+OpenAI-compatible `GROK_BASE_URL` (default `https://api.x.ai/v1`) and `GROK_MODEL`
+(default `grok-4`). Groq Cloud is a separate provider: `GROQ_BASE_URL` (default
+`https://api.groq.com/openai/v1`) and `GROQ_MODEL` (default `qwen/qwen3.8-27b`).
+`auto` prefers Groq (fastest verified planner), then Gemini, then Grok. If a planner fails,
+auto mode tries the next configured one and puts a visible fallback note in the plan; an
+explicitly chosen planner reports its own failure instead. Missing keys produce an honest
+unavailable state; manual discovery keeps working without AI. Model names change
+frequently, so all three are environment-configurable.
 
 ### Map and geocoding
 
@@ -294,7 +299,7 @@ server. Imports and scans require it to be running.
 
 ## Test strategy
 
-- **Vitest (130 tests, 10 files):** normalisation, dedupe policy, scoring engine,
+- **Vitest (132 tests, 10 files):** normalisation, dedupe policy, scoring engine,
   extraction, SSRF/security, import/ZIP parsing, discovery retry/cache, AI plan
   validation and geocode parsing, fetcher fixture server and workspace isolation. The
   isolation file hits a real PostgreSQL database.

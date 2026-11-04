@@ -47,9 +47,11 @@ from the defaults below, the affected areas should be revised and the audit re-r
 9. **OpenStreetMap** — the public Overpass endpoint is the default. For heavy use, a
    self-hosted or commercial Overpass instance is advisable. Do you have one? If you have
    a reliable mirror URL, add it to `OVERPASS_ENDPOINTS`.
-10. **Gemini / Grok** — both planners are implemented but stay unavailable until
-    `GEMINI_API_KEY` or `GROK_API_KEY` is set. Which account should be used, and is there a
-    preferred default model or spend cap? `auto` currently prefers Gemini.
+10. **Gemini / Grok / Groq** — all three planners are implemented. Gemini and Groq were
+    configured and verified live during the build; xAI Grok remains available but needs a
+    `GROK_API_KEY`. Which accounts should be the long-term defaults, and is there a spend
+    cap or preferred model? `auto` currently prefers Groq (fastest), then Gemini, then
+    Grok, and falls back when one fails.
 11. **Map preview** — the app uses Leaflet with public OpenStreetMap tiles and Nominatim
     geocoding. For high-traffic deployment, should tiles/geocoding move to a paid provider
     or a self-hosted instance? Set `GEOCODE_USER_AGENT` to a real contact either way.

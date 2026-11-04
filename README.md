@@ -18,10 +18,10 @@ human reviews and works through.
 - **Import** CSV, TSV, GeoJSON and ZIP uploads with column mapping, preview, row-level
   error reporting, duplicate detection, undo-safe merges and cancellation.
 - **Discover** businesses from OpenStreetMap (Overpass API) and, when a key is present,
-  Google Places. Optional Gemini or Grok planning turns plain language into validated
-  search filters — the models never supply leads. A Leaflet/OpenStreetMap map previews the
-  search area and plots real result coordinates. Providers are honest about availability;
-  there are no placeholder results.
+  Google Places. Optional Gemini, xAI Grok or Groq planning turns plain language into
+  validated search filters — the models never supply leads. A Leaflet/OpenStreetMap map
+  previews the search area and plots real result coordinates. Providers are honest about
+  availability; there are no placeholder results.
 - **Scan** public websites with a hardened fetcher: SSRF/DNS-rebinding protection,
   redirect re-validation, `robots.txt` checks, per-host politeness delays, timeouts, body
   size caps and a fixed user agent.
@@ -144,8 +144,9 @@ All variables are documented in [`.env.example`](.env.example). The most importa
 | `OVERPASS_CACHE_MINUTES` | `60` | In-memory cache for identical queries |
 | `GOOGLE_PLACES_API_KEY` | empty | Empty means the provider reports unavailable |
 | `GEOCODE_USER_AGENT` | scanner UA | Set a real contact for Nominatim in production |
-| `GEMINI_API_KEY` / `GEMINI_MODEL` | empty / `gemini-2.5-flash` | Optional AI search planner |
-| `GROK_API_KEY` / `GROK_MODEL` | empty / `grok-4` | Optional AI search planner |
+| `GEMINI_API_KEY` / `GEMINI_MODEL` | empty / `gemini-3.1-flash-lite` | Optional AI search planner |
+| `GROK_API_KEY` / `GROK_MODEL` | empty / `grok-4` | Optional xAI Grok planner |
+| `GROQ_API_KEY` / `GROQ_MODEL` | empty / `qwen/qwen3.8-27b` | Optional Groq Cloud planner (not xAI Grok) |
 | `PG_BOSS_SCHEMA` | `pgboss` | Job queue schema |
 | `LOG_LEVEL` | `info` | pino level |
 
@@ -155,8 +156,8 @@ Production startup refuses to run with the development auth secret or with
 ## Discovery, AI planning and maps
 
 Discovery has two real sources: OpenStreetMap (no key) and Google Places (key required).
-Search `/discovery` manually, or describe what you want and let Gemini/Grok produce a
-plan:
+Search `/discovery` manually, or describe what you want and let Gemini, xAI Grok or Groq
+produce a plan:
 
 1. The planner returns only `country`, `city`, categories (1–8), a result limit and a
    target provider. It has no schema fields for businesses, contacts or websites.
@@ -164,9 +165,11 @@ plan:
 3. Running the plan calls the live source, imports through the normal dedupe pipeline
    and plots returned coordinates on the OpenStreetMap map.
 
-If no AI key is set, the planner card says so and manual discovery still works. If
-Overpass is overloaded, the app retries, tries `OVERPASS_ENDPOINTS` mirrors in order and
-returns an honest error with the attempt count. Nothing is saved on failure.
+If no AI key is set, the planner card says so and manual discovery still works. `auto`
+prefers Groq for speed, then Gemini, then Grok, and transparently falls back if a planner
+fails (the plan preview shows which model was used). If Overpass is overloaded, the app
+retries, tries `OVERPASS_ENDPOINTS` mirrors in order and returns an honest error with the
+attempt count. Nothing is saved on failure.
 
 Maps use Leaflet with OpenStreetMap tiles. Geocoding uses Nominatim with a 1 request/second
 throttle and caching. Positions are source coordinates, not verified addresses. Set

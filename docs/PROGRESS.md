@@ -17,13 +17,13 @@ Final result on 2026-11-04:
 | --- | --- |
 | `pnpm typecheck` | Pass (no output) |
 | `pnpm lint` | Pass, 0 errors. One non-blocking React Compiler warning for TanStack Table's `useReactTable` |
-| `pnpm test` | Pass — 10 files, 130 tests |
+| `pnpm test` | Pass — 10 files, 132 tests |
 | `pnpm build` | Pass — 41 app paths compiled |
 | `pnpm exec playwright test` | Pass — 16 tests (1 setup + 15 Chromium) |
 | Screenshots | 60 PNGs at 1440/1024/390, light/dark |
 | Live discovery | Overpass retry/cache path exercised; honest 502 message verified when the public service was at capacity |
 | Live map | Nominatim geocode returned Lisbon bounds; Leaflet loaded OSM tiles with no console errors |
-| AI planner | Correct 409 unavailable state with no keys; mocked Gemini request/response covered by tests |
+| AI planner | Live Gemini (`gemini-3.1-flash-lite`, 1.3–22.6s across calls) and Groq (`qwen/qwen3.8-27b`, 0.3–0.6s) returned validated filters; auto mode resolved in 0.3s via Groq; fallback/no-key paths covered by tests |
 
 ## Phases
 
@@ -40,7 +40,7 @@ Final result on 2026-11-04:
 | 8 | Discovery, export, events, settings, worker: OSM provider, Google availability state, CSV export, SSE, scan/import/score jobs | typecheck; production acceptance run |
 | 9 | UI: app shell, dashboard, leads, lead detail, duplicates, imports, discovery, scans, settings, scoring, login/setup | typecheck/lint; responsive review; screenshots |
 | 10 | Tests, acceptance, docs, demo seed, screenshots, git history | full gate + Playwright + acceptance |
-| 11 | Discovery resilience and AI/map: Overpass retries/fallback/cache, Gemini and Grok filter planners, Nominatim geocoding, Leaflet result map | full gate + live geocode/map check + honest upstream-failure check |
+| 11 | Discovery resilience and AI/map: Overpass retries/fallback/cache, Gemini, xAI Grok and Groq filter planners, Nominatim geocoding, Leaflet result map | full gate + live planner/geocode/map checks + honest upstream-failure check |
 
 ## Acceptance run
 
@@ -60,7 +60,7 @@ running and a freshly seeded demo workspace. Results from the API-level acceptan
 | Scans | 6 listed, outcomes `success` and `partial` |
 | Scoring profile | Active profile maximum exactly 100 |
 | Discovery providers | `osm:available`, `google_places:unavailable` (no key configured) |
-| AI planners | `gemini:unavailable`, `grok:unavailable` (no keys); `POST /api/discovery/plan` returns an honest 409 |
+| AI planners | Live with configured keys: Gemini (`gemini-3.1-flash-lite`) and Groq (`qwen/qwen3.8-27b`) returned validated filters; xAI Grok remains unconfigured; the no-key 409 path stays covered by tests |
 | Geocoding | `GET /api/discovery/geocode?q=Lisbon, Portugal` returned 200 with bounds and two matches |
 | Map | Leaflet container loaded 8 OSM tiles; no browser console errors |
 | Overpass failure path | Public server returned 502 "at capacity"; the app reported attempts, mirror hint and no saved rows |
@@ -74,7 +74,7 @@ demo workspace deterministic. No acceptance data was written to a real workspace
 
 | Suite | Files | Tests | Notes |
 | --- | --- | --- | --- |
-| Vitest | 10 | 130 | Unit + integration against real PostgreSQL for isolation |
+| Vitest | 10 | 132 | Unit + integration against real PostgreSQL for isolation |
 | Playwright | 9 specs | 16 | 1 auth setup, 15 browser tests |
 
 Vitest files:
@@ -87,8 +87,8 @@ Vitest files:
 - `tests/fetch.test.ts` — robots, timeouts, pinned DNS, fixture server behaviour
 - `tests/import.test.ts` — CSV/TSV/GeoJSON/ZIP parsing and archive safety
 - `tests/discovery.test.ts` — Overpass retry, remark errors, cache and honest failure
-- `tests/planner.test.ts` — category aliases, plan validation, Gemini request shape,
-  unconfigured-planner behaviour, Nominatim parsing
+- `tests/planner.test.ts` — category aliases, plan validation, Gemini and Groq request
+  shapes, auto-mode fallback, unconfigured-planner behaviour, Nominatim parsing
 - `tests/isolation.test.ts` — workspace isolation, dedupe-by-host, scan-outcome filter,
   merge/undo preservation
 
@@ -191,6 +191,23 @@ has no business/contact fields. Unsupported categories are dropped with a visibl
 missing locations are rejected, and Google Places plans fall back to OpenStreetMap when no
 key is configured. The models never generate rows in the lead table.
 
+### AI planner model names changed under us
+
+The first live Gemini call failed with HTTP 404: `gemini-2.5-flash` is retired for new
+keys and the API recommended `gemini-3.8-flash`. That newer model, plus `gemini-3.7-flash`,
+`gemini-3.6-flash`, `gemini-3.5-flash` and `gemini-flash-latest`, were returning 503
+"high demand" or taking over a minute during the check, so the default became
+`gemini-3.1-flash-lite`, which returned valid JSON. Its latency still varied a lot across
+calls (1.3–22.6 seconds), which is why `auto` prefers Groq. All model names stay
+environment-configurable.
+
+The supplied "Groq" key (`gsk_...`) is Groq Cloud, not xAI Grok (`xai-...`). Groq is now a
+third first-class planner using its OpenAI-compatible endpoint. Its account did not expose
+`llama-3.3-70b-versatile`; `qwen/qwen3.8-27b` answered in about 0.3 seconds, so that is the
+default. In `auto` mode the app now tries Groq first for speed, then Gemini and Grok, and
+falls back to the next configured planner when one fails and shows a fallback note in the
+plan, rather than making the user retry manually.
+
 ### Map integration and CSP
 
 Leaflet is imported only in the browser and uses vector circle markers, so no marker image
@@ -212,8 +229,8 @@ confirmed 8 tiles loaded with no console errors.
   owner workspace stays clean.
 - `db:reset` requires explicit confirmation and refuses production.
 - The app name comes from `NEXT_PUBLIC_APP_NAME`, default `Lead Finder`.
-- Gemini/Grok are search planners only. Real leads always come from Overpass or Google
-  Places; the planner schema cannot carry business records.
+- Gemini, xAI Grok and Groq are search planners only. Real leads always come from Overpass
+  or Google Places; the planner schema cannot carry business records.
 - Public Overpass reliability is outside the app's control, so the app retries, falls back
   to configured mirrors, caches and reports failures honestly instead of inventing data.
 - `leaflet` is the only new runtime dependency for maps; tiles come directly from
