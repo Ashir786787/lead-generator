@@ -1,0 +1,207 @@
+[
+  {
+    "name": "Intercom",
+    "domains": ["intercom.io", "intercomcdn.com", "intercomassets.com"],
+    "patterns": ["window\\.intercomSettings", "intercom\\(['\"]boot"]
+  },
+  {
+    "name": "Drift",
+    "domains": ["drift.com", "driftt.com"],
+    "patterns": ["drift\\.load\\(", "js\\.driftt\\.com"]
+  },
+  {
+    "name": "Crisp",
+    "domains": ["crisp.chat"],
+    "patterns": ["CRISP_WEBSITE_ID", "client\\.crisp\\.chat"]
+  },
+  {
+    "name": "Tawk.to",
+    "domains": ["tawk.to"],
+    "patterns": ["Tawk_API", "embed\\.tawk\\.to"]
+  },
+  {
+    "name": "Zendesk",
+    "domains": ["zendesk.com", "zdassets.com", "zopim.com"],
+    "patterns": ["zE\\(", "zopim", "zdassets"]
+  },
+  {
+    "name": "LiveChat",
+    "domains": ["livechatinc.com", "livechat.com"],
+    "patterns": ["__lc\\.license", "livechatinc"]
+  },
+  {
+    "name": "HubSpot",
+    "domains": ["hs-scripts.com", "hubspot.com", "hsforms.net"],
+    "patterns": ["hsConversationsSettings", "HubSpotConversations", "js\\.hs-scripts\\.com"]
+  },
+  {
+    "name": "Freshchat",
+    "domains": ["freshchat.com", "freshworks.com", "wchat.freshchat.com"],
+    "patterns": ["fcWidget", "freshchat"]
+  },
+  {
+    "name": "Tidio",
+    "domains": ["tidio.co", "tidio.com"],
+    "patterns": ["tidioChatApi", "tidio"]
+  },
+  {
+    "name": "Olark",
+    "domains": ["olark.com"],
+    "patterns": ["olark\\.identify", "olark"]
+  },
+  {
+    "name": "Smartsupp",
+    "domains": ["smartsupp.com", "smartsuppchat.com"],
+    "patterns": ["smartsupp"]
+  },
+  {
+    "name": "LivePerson",
+    "domains": ["liveperson.net", "lpsnmedia.net"],
+    "patterns": ["lpTag", "liveperson"]
+  },
+  {
+    "name": "Facebook Messenger",
+    "domains": ["connect.facebook.net"],
+    "patterns": ["fb-customerchat", "fb_dialog", "customerchat"]
+  },
+  {
+    "name": "Botpress",
+    "domains": ["botpress.cloud", "botpress.com"],
+    "patterns": ["botpressWebChat", "botpress"]
+  },
+  {
+    "name": "ManyChat",
+    "domains": ["manychat.com"],
+    "patterns": ["manychat", "mc-widget"]
+  },
+  {
+    "name": "Chatwoot",
+    "domains": ["chatwoot.com"],
+    "patterns": ["window\\.chatwootSettings", "chatwoot"]
+  },
+  {
+    "name": "Gorgias",
+    "domains": ["gorgias.chat", "gorgias.com"],
+    "patterns": ["gorgias"]
+  },
+  {
+    "name": "Kustomer",
+    "domains": ["kustomer.com", "kustomerapp.com"],
+    "patterns": ["kustomer"]
+  },
+  {
+    "name": "Ada",
+    "domains": ["ada.support", "adasupport.com"],
+    "patterns": ["ada\\.support", "adaEmbed"]
+  },
+  {
+    "name": "Landbot",
+    "domains": ["landbot.io"],
+    "patterns": ["landbot"]
+  },
+  {
+    "name": "Voiceflow",
+    "domains": ["voiceflow.com"],
+    "patterns": ["voiceflow"]
+  },
+  {
+    "name": "Wix Chat",
+    "domains": ["wix.com", "wixstatic.com"],
+    "patterns": ["wixchat", "wix-chat"]
+  },
+  {
+    "name": "Podium",
+    "domains": ["podium.com"],
+    "patterns": ["podium"]
+  },
+  {
+    "name": "Birdeye",
+    "domains": ["birdeye.com"],
+    "patterns": ["birdeye"]
+  },
+  {
+    "name": "Salesforce",
+    "domains": ["salesforce.com", "salesforce-sites.com", "force.com"],
+    "patterns": ["embeddedservice", "liveagent"]
+  },
+  {
+    "name": "Genesys",
+    "domains": ["genesys.cloud", "genesys.com"],
+    "patterns": ["genesys"]
+  },
+  {
+    "name": "Shopify Inbox",
+    "domains": ["shopify.com", "shopifycdn.com"],
+    "patterns": ["shopify-chat", "shopify.*inbox"]
+  },
+  {
+    "name": "Elfsight",
+    "domains": ["elfsight.com"],
+    "patterns": ["elfsight"]
+  },
+  {
+    "name": "Chatra",
+    "domains": ["chatra.io"],
+    "patterns": ["chatra"]
+  },
+  {
+    "name": "JivoChat",
+    "domains": ["jivosite.com", "jivo.ru"],
+    "patterns": ["jivo"]
+  },
+  {
+    "name": "Help Scout Beacon",
+    "domains": ["helpscout.net", "beacon-v2.helpscout.net"],
+    "patterns": ["Beacon\\("]
+  },
+  {
+    "name": "Re:amaze",
+    "domains": ["reamaze.com"],
+    "patterns": ["reamaze"]
+  },
+  {
+    "name": "Chatlio",
+    "domains": ["chatlio.com"],
+    "patterns": ["chatlio"]
+  },
+  {
+    "name": "Sendbird",
+    "domains": ["sendbird.com"],
+    "patterns": ["sendbird"]
+  },
+  {
+    "name": "Zoho SalesIQ",
+    "domains": ["salesiq.zoho.com", "zohopublic.com"],
+    "patterns": ["\\$zoho\\.salesiq", "zoho.*salesiq"]
+  },
+  {
+    "name": "Kommunicate",
+    "domains": ["kommunicate.io"],
+    "patterns": ["kommunicate"]
+  },
+  {
+    "name": "Chaport",
+    "domains": ["chaport.com"],
+    "patterns": ["chaport"]
+  },
+  {
+    "name": "Userlike",
+    "domains": ["userlike.com"],
+    "patterns": ["userlike"]
+  },
+  {
+    "name": "Verloop",
+    "domains": ["verloop.io"],
+    "patterns": ["verloop"]
+  },
+  {
+    "name": "Haptik",
+    "domains": ["haptik.ai"],
+    "patterns": ["haptik"]
+  },
+  {
+    "name": "Trengo",
+    "domains": ["trengo.com"],
+    "patterns": ["trengo"]
+  }
+]
