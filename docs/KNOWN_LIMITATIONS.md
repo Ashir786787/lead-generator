@@ -103,6 +103,31 @@ limitation affects a user decision, the UI is expected to say so honestly.
     reviewed but not executed on this machine; the equivalent schema and migrations were
     verified against the embedded instance.
 
+## AI planning and maps
+
+39. **Gemini and Grok are optional planners, not data sources.** They receive the user's
+    description and return only country, city, categories, a limit and a target provider.
+    They cannot add businesses, contacts or websites. Without a key, the planner card says
+    so and manual discovery remains available.
+40. **Plans can be imperfect.** The app validates and normalises the model's output
+    (category aliases, 1–8 categories, 1–200 results) and rejects missing locations, but a
+    plan may still be too broad or miss a niche category. Review the filters before
+    running.
+41. **Public Overpass is a shared, best-effort service.** It can take 30–60 seconds, return
+    502 "at capacity", time out, or rate-limit. The app backs off, retries and falls back
+    to `OVERPASS_ENDPOINTS`, then reports the failure honestly. It does not substitute a
+    regional mirror that would silently return incomplete data.
+42. **Map positions are source coordinates.** Leaflet/OpenStreetMap markers show where the
+    source placed a business; they are not verified addresses. Tiles require internet
+    access and are subject to the OpenStreetMap tile usage policy. Up to 200 mapped results
+    are shown per run.
+43. **Nominatim geocoding is rate-limited.** Requests are cached and throttled to one per
+    second, per process. Set `GEOCODE_USER_AGENT` to a real contact before public use.
+    Place names that Nominatim cannot resolve fall back to manual city/country entry.
+44. **Google Places result caps apply.** Text Search returns at most 20 places per request;
+    the app does not paginate for more. Its terms and billing are the key owner's
+    responsibility.
+
 ## Product boundary
 
 36. **No outreach is sent.** There is no email, SMS or WhatsApp integration, by design.

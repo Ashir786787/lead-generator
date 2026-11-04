@@ -45,12 +45,19 @@ from the defaults below, the affected areas should be revised and the audit re-r
 8. **Google Places** — the provider is implemented but reports unavailable until
    `GOOGLE_PLACES_API_KEY` is set. Do you have a key and a budget policy to enable it?
 9. **OpenStreetMap** — the public Overpass endpoint is the default. For heavy use, a
-   self-hosted or commercial Overpass instance is advisable. Do you have one?
-10. **Scan depth** — default is 4 pages per site, 7-day cache, 1 request/second/host.
+   self-hosted or commercial Overpass instance is advisable. Do you have one? If you have
+   a reliable mirror URL, add it to `OVERPASS_ENDPOINTS`.
+10. **Gemini / Grok** — both planners are implemented but stay unavailable until
+    `GEMINI_API_KEY` or `GROK_API_KEY` is set. Which account should be used, and is there a
+    preferred default model or spend cap? `auto` currently prefers Gemini.
+11. **Map preview** — the app uses Leaflet with public OpenStreetMap tiles and Nominatim
+    geocoding. For high-traffic deployment, should tiles/geocoding move to a paid provider
+    or a self-hosted instance? Set `GEOCODE_USER_AGENT` to a real contact either way.
+12. **Scan depth** — default is 4 pages per site, 7-day cache, 1 request/second/host.
     Should the scanner look at more pages (for example team/about/contact) or fewer?
-11. **Outreach** — the app intentionally contains no email/SMS/WhatsApp sending. Confirm
+13. **Outreach** — the app intentionally contains no email/SMS/WhatsApp sending. Confirm
     this remains a hard boundary (it is implemented as one).
-12. **Robots policy** — disallowed paths are skipped and the scan is marked partial or
+14. **Robots policy** — disallowed paths are skipped and the scan is marked partial or
     incomplete. Should the product instead refuse to scan any site whose `robots.txt`
     disallows the homepage?
 

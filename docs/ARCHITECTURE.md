@@ -38,7 +38,7 @@ src/lib/auth/            Better Auth config, session → workspace context, page
 src/lib/data/            Workspace-scoped reads, mutations, filters, facets, saved views
 src/lib/db/              Drizzle client, schema, generated migrations
 src/lib/dedupe/          Deterministic decision policy + merge/undo service
-src/lib/discovery/       OSM Overpass and Google Places providers
+src/lib/discovery/       OSM Overpass, Google Places, AI planning and Nominatim geocoding
 src/lib/events/          In-process SSE event bus
 src/lib/export/          CSV generation and export job record
 src/lib/import/          Upload parsing, CSV/ZIP safety, mapping, ingestion
@@ -213,15 +213,49 @@ Rules enforced by the engine and covered by tests:
 
 `/discovery` supports two real providers:
 
-- **OpenStreetMap / Overpass** — named amenity/shop/tourism queries by country and city.
-  Results include OSM tags and a source URL; they are imported as `source_records`.
-  Responses are cached for `OVERPASS_CACHE_MINUTES`.
-- **Google Places** — used only when `GOOGLE_PLACES_API_KEY` is set and the daily budget
-  allows it. With no key the UI shows an explicit unavailable state.
+- **OpenStreetMap / Overpass** - named amenity/shop/tourism queries by country and city.
+  Results include OSM tags and a source ID; they are imported as `source_records`.
+  Requests are retried across `OVERPASS_ENDPOINTS` on 429/5xx/network failures, with
+  per-attempt timeouts (`OVERPASS_TIMEOUT_MS`) and an in-memory cache
+  (`OVERPASS_CACHE_MINUTES`). The default endpoint is `overpass-api.de`; no unreliable
+  mirror is hardcoded.
+- **Google Places** - used only when `GOOGLE_PLACES_API_KEY` is set. With no key the UI
+  shows an explicit unavailable state. The daily budget is displayed as configuration and
+  is not yet enforced by a persistent counter.
 
 There is no generated/placeholder provider. If a source fails, the run reports the
 failure; it does not substitute fake businesses. Saved searches let a user repeat a
 query; runs are recorded and marked.
+
+### AI search planner (Gemini / Grok)
+
+`POST /api/discovery/plan` turns a plain-language request into validated filters:
+country, city, 1-8 category keys, a result limit and a target provider. The model
+receives only the user's description and a strict system prompt. It is never treated as
+a data source: the response schema has no fields for business names, addresses, phones,
+emails or websites, and the app rejects anything outside the filter shape. The resulting
+filters must still be run through Overpass or Google Places.
+
+Gemini uses `GEMINI_MODEL` (default `gemini-2.5-flash`). Grok uses the OpenAI-compatible
+`GROK_BASE_URL` (default `https://api.x.ai/v1`) and `GROK_MODEL` (default `grok-4`).
+`auto` picks the first configured planner. Missing keys produce an honest unavailable
+state; manual discovery keeps working without AI.
+
+### Map and geocoding
+
+`GET /api/discovery/geocode` proxies OpenStreetMap Nominatim, with caching, a 1 req/s
+throttle and a configurable user agent (`GEOCODE_USER_AGENT`). The discovery screen uses
+it to preview the search area and plots result coordinates on a Leaflet map with OSM
+tiles. Map positions come from the source and are labelled as unverified; no address is
+invented. The UI shows up to 200 mapped results from the current run.
+
+### Discovery failure handling
+
+When every Overpass attempt fails, the API returns the number of attempts, the last
+status or reason, and actionable options (retry later, narrow the search, add a mirror or
+configure Google Places). Nothing is saved. The public Overpass service is shared and
+can return 502 "at capacity"; the app backs off, falls back to configured mirrors and
+never shows placeholder results.
 
 ## Export
 
@@ -260,9 +294,10 @@ server. Imports and scans require it to be running.
 
 ## Test strategy
 
-- **Vitest (113 tests, 8 files):** normalisation, dedupe policy, scoring engine,
-  extraction, SSRF/security, import/ZIP parsing, fetcher fixture server and workspace
-  isolation. The isolation file hits a real PostgreSQL database.
+- **Vitest (130 tests, 10 files):** normalisation, dedupe policy, scoring engine,
+  extraction, SSRF/security, import/ZIP parsing, discovery retry/cache, AI plan
+  validation and geocode parsing, fetcher fixture server and workspace isolation. The
+  isolation file hits a real PostgreSQL database.
 - **Playwright (16 tests):** auth gating, dashboard, leads, lead detail, duplicates,
   imports (including preview), discovery availability, scans, settings, and responsive
   layout at narrow widths.

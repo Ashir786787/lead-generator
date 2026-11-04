@@ -17,10 +17,13 @@ Final result on 2026-11-04:
 | --- | --- |
 | `pnpm typecheck` | Pass (no output) |
 | `pnpm lint` | Pass, 0 errors. One non-blocking React Compiler warning for TanStack Table's `useReactTable` |
-| `pnpm test` | Pass — 8 files, 113 tests |
-| `pnpm build` | Pass — 40 app paths compiled |
+| `pnpm test` | Pass — 10 files, 130 tests |
+| `pnpm build` | Pass — 41 app paths compiled |
 | `pnpm exec playwright test` | Pass — 16 tests (1 setup + 15 Chromium) |
 | Screenshots | 60 PNGs at 1440/1024/390, light/dark |
+| Live discovery | Overpass retry/cache path exercised; honest 502 message verified when the public service was at capacity |
+| Live map | Nominatim geocode returned Lisbon bounds; Leaflet loaded OSM tiles with no console errors |
+| AI planner | Correct 409 unavailable state with no keys; mocked Gemini request/response covered by tests |
 
 ## Phases
 
@@ -37,6 +40,7 @@ Final result on 2026-11-04:
 | 8 | Discovery, export, events, settings, worker: OSM provider, Google availability state, CSV export, SSE, scan/import/score jobs | typecheck; production acceptance run |
 | 9 | UI: app shell, dashboard, leads, lead detail, duplicates, imports, discovery, scans, settings, scoring, login/setup | typecheck/lint; responsive review; screenshots |
 | 10 | Tests, acceptance, docs, demo seed, screenshots, git history | full gate + Playwright + acceptance |
+| 11 | Discovery resilience and AI/map: Overpass retries/fallback/cache, Gemini and Grok filter planners, Nominatim geocoding, Leaflet result map | full gate + live geocode/map check + honest upstream-failure check |
 
 ## Acceptance run
 
@@ -56,6 +60,10 @@ running and a freshly seeded demo workspace. Results from the API-level acceptan
 | Scans | 6 listed, outcomes `success` and `partial` |
 | Scoring profile | Active profile maximum exactly 100 |
 | Discovery providers | `osm:available`, `google_places:unavailable` (no key configured) |
+| AI planners | `gemini:unavailable`, `grok:unavailable` (no keys); `POST /api/discovery/plan` returns an honest 409 |
+| Geocoding | `GET /api/discovery/geocode?q=Lisbon, Portugal` returned 200 with bounds and two matches |
+| Map | Leaflet container loaded 8 OSM tiles; no browser console errors |
+| Overpass failure path | Public server returned 502 "at capacity"; the app reported attempts, mirror hint and no saved rows |
 | CSV export | 200, 11 lines, includes the imported lead; recorded in `export_jobs` |
 | Workspaces | 1 workspace, active workspace id returned |
 
@@ -66,7 +74,7 @@ demo workspace deterministic. No acceptance data was written to a real workspace
 
 | Suite | Files | Tests | Notes |
 | --- | --- | --- | --- |
-| Vitest | 8 | 113 | Unit + integration against real PostgreSQL for isolation |
+| Vitest | 10 | 130 | Unit + integration against real PostgreSQL for isolation |
 | Playwright | 9 specs | 16 | 1 auth setup, 15 browser tests |
 
 Vitest files:
@@ -78,12 +86,15 @@ Vitest files:
 - `tests/security.test.ts` — SSRF classification, redirects, unsafe URLs
 - `tests/fetch.test.ts` — robots, timeouts, pinned DNS, fixture server behaviour
 - `tests/import.test.ts` — CSV/TSV/GeoJSON/ZIP parsing and archive safety
+- `tests/discovery.test.ts` — Overpass retry, remark errors, cache and honest failure
+- `tests/planner.test.ts` — category aliases, plan validation, Gemini request shape,
+  unconfigured-planner behaviour, Nominatim parsing
 - `tests/isolation.test.ts` — workspace isolation, dedupe-by-host, scan-outcome filter,
   merge/undo preservation
 
-Playwright coverage: auth gating, wrong password, dashboard, discovery availability,
-duplicates, imports + preview, leads list/filter, lead detail, scans, settings,
-responsive layout.
+Playwright coverage: auth gating, wrong password, dashboard, discovery availability, the
+AI planner's honest unavailable state, duplicates, imports + preview, leads list/filter,
+lead detail, scans, settings, responsive layout.
 
 ## Screenshots
 
@@ -157,6 +168,36 @@ documented policy: a shared domain merges only with supporting name/location evi
 Resolved by design: OSM is a real provider; Google Places is explicitly unavailable
 without a key. There is no placeholder/generated fallback.
 
+### Public Overpass is unreliable and the first implementation hid it
+
+Symptom: a live Lisbon search timed out at 30 seconds; the next attempt received
+`HTTP 502` from `overpass-api.de` with "All query workers are busy". The old provider made
+one request with a fixed timeout, had no retry, no fallback endpoint and no cache.
+
+Fix: `src/lib/discovery/service.ts` now has a configurable endpoint list
+(`OVERPASS_ENDPOINTS`), per-attempt timeout (`OVERPASS_TIMEOUT_MS`), bounded retries with
+backoff and `Retry-After` support, fallback across mirrors, and an in-memory cache
+honouring `OVERPASS_CACHE_MINUTES`. Error text includes the attempt count and the last
+real reason. The timeout was raised to 55 seconds because the public service can queue a
+valid query for 30–40 seconds. No regional mirror was hardcoded, because one tested
+mirror answers but only contains Swiss data — using it would silently return incomplete
+results.
+
+### AI could have become a fake lead source
+
+The planner is deliberately constrained: it receives only the user's description, must
+return a JSON filter object, and the server validates it with Zod before use. The schema
+has no business/contact fields. Unsupported categories are dropped with a visible note,
+missing locations are rejected, and Google Places plans fall back to OpenStreetMap when no
+key is configured. The models never generate rows in the lead table.
+
+### Map integration and CSP
+
+Leaflet is imported only in the browser and uses vector circle markers, so no marker image
+assets are needed. The CSP `img-src` was extended for `*.tile.openstreetmap.org`, and
+`.leaflet-container` is isolated so tile panes cannot sit above app chrome. A live check
+confirmed 8 tiles loaded with no console errors.
+
 ## Decision log (abbreviated)
 
 - Local PostgreSQL runs through `embedded-postgres` on port 5433 because Docker and a
@@ -171,3 +212,9 @@ without a key. There is no placeholder/generated fallback.
   owner workspace stays clean.
 - `db:reset` requires explicit confirmation and refuses production.
 - The app name comes from `NEXT_PUBLIC_APP_NAME`, default `Lead Finder`.
+- Gemini/Grok are search planners only. Real leads always come from Overpass or Google
+  Places; the planner schema cannot carry business records.
+- Public Overpass reliability is outside the app's control, so the app retries, falls back
+  to configured mirrors, caches and reports failures honestly instead of inventing data.
+- `leaflet` is the only new runtime dependency for maps; tiles come directly from
+  OpenStreetMap with attribution, and geocoding uses Nominatim with a throttled proxy.

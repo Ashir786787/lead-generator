@@ -18,8 +18,10 @@ human reviews and works through.
 - **Import** CSV, TSV, GeoJSON and ZIP uploads with column mapping, preview, row-level
   error reporting, duplicate detection, undo-safe merges and cancellation.
 - **Discover** businesses from OpenStreetMap (Overpass API) and, when a key is present,
-  Google Places. Providers are honest about availability; there are no placeholder
-  results.
+  Google Places. Optional Gemini or Grok planning turns plain language into validated
+  search filters — the models never supply leads. A Leaflet/OpenStreetMap map previews the
+  search area and plots real result coordinates. Providers are honest about availability;
+  there are no placeholder results.
 - **Scan** public websites with a hardened fetcher: SSRF/DNS-rebinding protection,
   redirect re-validation, `robots.txt` checks, per-host politeness delays, timeouts, body
   size caps and a fixed user agent.
@@ -31,8 +33,8 @@ human reviews and works through.
 - **Work the list** with filters, saved views, notes, tags, pipeline status, follow-up
   dates, do-not-contact, bulk actions and CSV export.
 
-The app compiles to 40 routes: 12 pages, 26 API handlers and the framework's global
-error/not-found entries.
+The app compiles to 41 app paths: 12 pages, 28 API handlers and the framework's
+not-found entry.
 
 ## Honest labels
 
@@ -136,13 +138,39 @@ All variables are documented in [`.env.example`](.env.example). The most importa
 | `MAX_UPLOAD_BYTES` | 50 MiB | Upload cap |
 | `SCAN_*` | see example | Timeouts, page count, politeness, UA |
 | `ALLOW_PRIVATE_TARGETS_FOR_TESTS` | `false` | Test-only; startup fails in production |
-| `OVERPASS_ENDPOINT` | public OSM endpoint | Real discovery source |
+| `OVERPASS_ENDPOINT` | public OSM endpoint | Primary real discovery source |
+| `OVERPASS_ENDPOINTS` | empty | Comma-separated fallback mirrors |
+| `OVERPASS_TIMEOUT_MS` / `OVERPASS_RETRIES` | `55000` / `1` | Per-attempt timeout and retries |
+| `OVERPASS_CACHE_MINUTES` | `60` | In-memory cache for identical queries |
 | `GOOGLE_PLACES_API_KEY` | empty | Empty means the provider reports unavailable |
+| `GEOCODE_USER_AGENT` | scanner UA | Set a real contact for Nominatim in production |
+| `GEMINI_API_KEY` / `GEMINI_MODEL` | empty / `gemini-2.5-flash` | Optional AI search planner |
+| `GROK_API_KEY` / `GROK_MODEL` | empty / `grok-4` | Optional AI search planner |
 | `PG_BOSS_SCHEMA` | `pgboss` | Job queue schema |
 | `LOG_LEVEL` | `info` | pino level |
 
 Production startup refuses to run with the development auth secret or with
 `ALLOW_PRIVATE_TARGETS_FOR_TESTS=true`.
+
+## Discovery, AI planning and maps
+
+Discovery has two real sources: OpenStreetMap (no key) and Google Places (key required).
+Search `/discovery` manually, or describe what you want and let Gemini/Grok produce a
+plan:
+
+1. The planner returns only `country`, `city`, categories (1–8), a result limit and a
+   target provider. It has no schema fields for businesses, contacts or websites.
+2. The app validates the plan and shows the filters for review.
+3. Running the plan calls the live source, imports through the normal dedupe pipeline
+   and plots returned coordinates on the OpenStreetMap map.
+
+If no AI key is set, the planner card says so and manual discovery still works. If
+Overpass is overloaded, the app retries, tries `OVERPASS_ENDPOINTS` mirrors in order and
+returns an honest error with the attempt count. Nothing is saved on failure.
+
+Maps use Leaflet with OpenStreetMap tiles. Geocoding uses Nominatim with a 1 request/second
+throttle and caching. Positions are source coordinates, not verified addresses. Set
+`GEOCODE_USER_AGENT` to a real contact URL/email before public deployment.
 
 ## Data safety
 
