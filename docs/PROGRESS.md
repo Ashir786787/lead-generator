@@ -17,13 +17,13 @@ Final result on 2026-11-05:
 | --- | --- |
 | `pnpm typecheck` | Pass (no output) |
 | `pnpm lint` | Pass, 0 errors. One non-blocking React Compiler warning for TanStack Table's `useReactTable` |
-| `pnpm test` | Pass — 10 files, 142 tests |
+| `pnpm test` | Pass — 10 files, 144 tests |
 | `pnpm build` | Pass — 41 app paths compiled |
 | `pnpm exec playwright test` | Pass — 17 tests (1 setup + 16 Chromium) |
 | Screenshots | 60 PNGs at 1440/1024/390, light/dark |
 | Live discovery | Nominatim POI index returned real records in 1.5–3.8 s for Lisbon dentists (30), Berlin cafes (20), Karachi restaurants (25) and Madrid law firms (19); honest combined error covered by tests |
 | Live map | Nominatim geocode returned Lisbon bounds; Leaflet loaded OSM tiles with no console errors |
-| AI assistant | Live Groq (`qwen/qwen3.8-27b`) returned validated filters for “cafes in Berlin” in 376 ms, live advice for a general lead question in 686 ms, and a clarification for “dentists in a city near me” in 411 ms; advice, missing-city guidance and category guidance covered by tests |
+| AI assistant | Live Groq (`qwen/qwen3.8-27b`) returned validated filters for “cafes in Berlin” in 376 ms, advice for a general lead question in 686 ms, a clarification for “dentists in a city near me” in 411 ms, and a context-aware follow-up: “I sell web design services…” then “Berlin” produced a Berlin plan for restaurants, salons, gyms and clinics. Advice, missing-city guidance, category guidance and history forwarding are covered by tests |
 
 ## Phases
 
@@ -42,7 +42,7 @@ Final result on 2026-11-05:
 | 10 | Tests, acceptance, docs, demo seed, screenshots, git history | full gate + Playwright + acceptance |
 | 11 | Discovery resilience and AI/map: Overpass retries/fallback/cache, Gemini, xAI Grok and Groq filter planners, Nominatim geocoding, Leaflet result map | full gate + live planner/geocode/map checks + honest upstream-failure check |
 | 12 | Reliable free discovery and chat assistant: Nominatim POI tag search first, Overpass backup, city-only searches, chat-style plan replies, early stop on invalid plans | full gate + live API planner/discovery checks |
-| 13 | Conversational assistant: search vs advice intents, guidance for general lead questions, chat clarification instead of a missing-city error, no provider retry for advice | full gate + live advice/clarification/search checks + Playwright advice bubble |
+| 13 | Conversational assistant: search vs advice intents, guidance for general lead questions, recent-turn context for follow-ups, chat clarification instead of a missing-city error, no provider retry for advice | full gate + live advice/clarification/search/follow-up checks + Playwright advice bubble |
 
 ## Acceptance run
 
@@ -77,7 +77,7 @@ demo workspace deterministic. No acceptance data was written to a real workspace
 
 | Suite | Files | Tests | Notes |
 | --- | --- | --- | --- |
-| Vitest | 10 | 142 | Unit + integration against real PostgreSQL for isolation |
+| Vitest | 10 | 144 | Unit + integration against real PostgreSQL for isolation |
 | Playwright | 9 specs | 17 | 1 auth setup, 16 browser tests |
 
 Vitest files:
@@ -253,13 +253,15 @@ through the search-plan schema, so the only possible outcome was a validation er
 Fix: the assistant schema now has an explicit `intent` (`search` or `advice`) and an
 `answer` field. General questions, “how do I use this?”, scoring questions and requests
 with no city return plain-text guidance in the chat thread; a search plan still renders
-the category/limit preview with “Apply & run”. Missing-city and unsupported-category
-replies now ask for the missing detail instead of throwing a `400`, so `auto` mode returns
-the first valid reply and does not retry every provider. Advice is capped at 1,600
-characters, never carries business/contact fields, and the prompt forbids naming real
-companies. Live Groq checks returned advice in 686 ms, a city clarification in 411 ms and
-a valid Berlin cafe plan in 376 ms. Unit tests cover all three intents and the Playwright
-suite checks that an advice reply renders without “Apply” buttons.
+the category/limit preview with “Apply & run”. The chat also sends the last eight turns
+with each message, so a follow-up such as a bare city keeps its context. Missing-city and
+unsupported-category replies now ask for the missing detail instead of throwing a `400`,
+so `auto` mode returns the first valid reply and does not retry every provider. Advice is
+capped at 1,600 characters, never carries business/contact fields, and the prompt forbids
+naming real companies. Live Groq checks returned advice in 686 ms, a city clarification in
+411 ms and a valid Berlin cafe plan in 376 ms. Unit tests cover all three intents and
+history forwarding; the Playwright suite checks that an advice reply renders without
+“Apply” buttons.
 
 ## Decision log (abbreviated)
 
@@ -278,9 +280,11 @@ suite checks that an advice reply renders without “Apply” buttons.
 - Gemini, xAI Grok and Groq are search planners only. Real leads always come from the
   Nominatim POI index, Overpass or Google Places; the planner schema cannot carry business
   records.
-- The assistant also answers general questions with labeled guidance. A reply without a
-  city or supported category asks for the missing detail rather than failing, so the chat
-  is useful for “how do I use this?” without weakening search validation.
+- The assistant also answers general questions with labeled guidance and uses the last
+  eight turns for follow-ups. A reply without a city or supported category asks for the
+  missing detail rather than failing, so the chat is useful for “how do I use this?”
+  without weakening search validation. Only user messages and assistant replies or plan
+  summaries are sent to the model, never workspace leads.
 - Public Overpass reliability is outside the app's control, so discovery reads the
   Nominatim POI index first, uses Overpass only as a backup, caches and reports failures
   honestly instead of inventing data.

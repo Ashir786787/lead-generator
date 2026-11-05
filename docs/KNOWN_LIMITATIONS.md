@@ -143,6 +143,11 @@ limitation affects a user decision, the UI is expected to say so honestly.
     explain how scoring works and describe honest scan labels, but it cannot know whether a
     particular business has a website, chatbot, phone number or need. Chat replies are
     capped at 1,600 characters and should be treated as general guidance, not lead data.
+47. **Chat context is recent and session-only.** The browser sends at most the previous 8
+    turns with each new message, and long turns are truncated for the provider request.
+    Conversations are not stored, so reloading the page loses context. Only user messages
+    and assistant replies or plan summaries are sent to the model; workspace leads and
+    contacts are not.
 
 ## Product boundary
 

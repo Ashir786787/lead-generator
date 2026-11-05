@@ -128,6 +128,30 @@ interface ChatEntry {
   error: string | null;
 }
 
+interface PlannerMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/** Previous turns give follow-ups such as a bare city their context. */
+function buildHistory(entries: ChatEntry[]): PlannerMessage[] {
+  const messages: PlannerMessage[] = [];
+  for (const entry of entries) {
+    messages.push({ role: "user", content: entry.prompt });
+    if (entry.plan?.intent === "advice") {
+      messages.push({ role: "assistant", content: entry.plan.answer });
+    } else if (entry.plan) {
+      messages.push({
+        role: "assistant",
+        content: `Search plan: ${entry.plan.categories.join(", ")} in ${[entry.plan.city, entry.plan.country]
+          .filter(Boolean)
+          .join(", ")}. The user has not run it yet.`,
+      });
+    }
+  }
+  return messages.slice(-8);
+}
+
 const CHAT_EXAMPLES = [
   "Dentists in Lisbon, Portugal",
   "Cafes in Berlin",
@@ -231,6 +255,7 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
       return;
     }
     const entryId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const history = buildHistory(chat);
     setChat((current) => [...current, { id: entryId, prompt: text, plan: null, error: null }]);
     setPrompt("");
     setPlanning(true);
@@ -239,7 +264,7 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
         "/api/discovery/plan",
         {
           method: "POST",
-          body: JSON.stringify({ prompt: text, planner }),
+          body: JSON.stringify({ prompt: text, planner, history }),
         },
       );
       setChat((current) =>

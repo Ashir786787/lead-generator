@@ -167,10 +167,13 @@ help:
 2. Ask a general question, for example “which kinds of businesses are good leads?” or
    “how does the lead score work?”. The assistant replies with plain-text guidance in
    `answer`. Advice never names a real business and is not a search plan.
-3. The app validates a search plan and shows the filters as a chat reply. A city is
+3. Follow-ups keep context. The browser sends up to the last 8 turns, so a reply such as
+   “web design” followed by “Berlin” can become a plan. Only your messages and the
+   assistant's replies or plan summaries are sent; workspace leads and contacts never are.
+4. The app validates a search plan and shows the filters as a chat reply. A city is
    required; a missing country is allowed and noted. If no city is given, or no supported
    category matches, the assistant asks for that detail instead of producing an error.
-4. Running the plan calls the live source, imports through the normal dedupe pipeline
+5. Running the plan calls the live source, imports through the normal dedupe pipeline
    and plots returned coordinates on the OpenStreetMap map.
 
 If no AI key is set, the assistant says so and manual discovery still works. `auto`

@@ -15,6 +15,15 @@ const planSchema = z.object({
     .min(3, "Ask for leads or for guidance on choosing them.")
     .max(600, "Keep the request under 600 characters."),
   planner: z.enum(["auto", "gemini", "grok", "groq"]).default("auto"),
+  history: z
+    .array(
+      z.object({
+        role: z.enum(["user", "assistant"]),
+        content: z.string().trim().min(1).max(1600),
+      }),
+    )
+    .max(10)
+    .default([]),
 });
 
 export async function POST(request: Request) {
@@ -22,7 +31,11 @@ export async function POST(request: Request) {
     const ctx = await getWorkspaceContext();
     checkRateLimit(`discovery-plan:${ctx.user.id}`, 10, 60_000);
     const body = planSchema.parse(await request.json());
-    const plan = await planDiscovery({ prompt: body.prompt, planner: body.planner });
+    const plan = await planDiscovery({
+      prompt: body.prompt,
+      planner: body.planner,
+      history: body.history,
+    });
     return NextResponse.json({ plan, planners: plannerStatuses() });
   });
 }

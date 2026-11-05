@@ -247,6 +247,95 @@ describe("planDiscovery provider calls", () => {
     expect(body.model).toBe(env.groq.model);
   });
 
+  it("forwards recent conversation turns to OpenAI-compatible planners", async () => {
+    (env.groq as { apiKey: string }).apiKey = "test-key";
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  city: "Berlin",
+                  country: "Germany",
+                  categories: ["restaurant", "salon", "clinic"],
+                  limit: 50,
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await planDiscovery({
+      prompt: "Berlin",
+      planner: "groq",
+      history: [
+        { role: "user", content: "what kind of leads are helpful for a web design studio?" },
+        {
+          role: "assistant",
+          content: "Good targets include restaurants, salons and clinics. Which city?",
+        },
+        { role: "user", content: "I sell web design services" },
+        { role: "user", content: "Berlin" },
+      ],
+    });
+
+    const body = JSON.parse(
+      String((fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.body),
+    ) as { messages?: Array<{ role: string; content: string }> };
+    expect(body.messages).toHaveLength(6); // system + 4 history turns + current message
+    expect(body.messages?.[1]).toMatchObject({ role: "user" });
+    expect(body.messages?.[1]?.content).toMatch(/web design studio/i);
+    expect(body.messages?.[2]).toMatchObject({ role: "assistant" });
+    expect(body.messages?.at(-1)?.content).toMatch(/Berlin/);
+  });
+
+  it("maps conversation history to Gemini user and model turns", async () => {
+    (env.gemini as { apiKey: string }).apiKey = "test-key";
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      city: "Berlin",
+                      country: "Germany",
+                      categories: ["restaurant"],
+                      limit: 50,
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await planDiscovery({
+      prompt: "Berlin",
+      planner: "gemini",
+      history: [
+        { role: "user", content: "which businesses are good leads?" },
+        { role: "assistant", content: "Restaurants and salons. Which city?" },
+      ],
+    });
+
+    const body = JSON.parse(
+      String((fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.body),
+    ) as { contents?: Array<{ role: string }> };
+    expect(body.contents?.map((item) => item.role)).toEqual(["user", "model", "user"]);
+  });
+
   it("auto mode answers a missing-city request without retrying other providers", async () => {
     (env.gemini as { apiKey: string }).apiKey = "test-gemini";
     (env.groq as { apiKey: string }).apiKey = "test-groq";
