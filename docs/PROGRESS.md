@@ -17,9 +17,11 @@ Final result on 2026-11-05:
 | --- | --- |
 | `pnpm typecheck` | Pass (no output) |
 | `pnpm lint` | Pass, 0 errors. One non-blocking React Compiler warning for TanStack Table's `useReactTable` |
-| `pnpm test` | Pass — 10 files, 144 tests |
-| `pnpm build` | Pass — 41 app paths compiled |
-| `pnpm exec playwright test` | Pass — 17 tests (1 setup + 16 Chromium) |
+| `pnpm test` | Pass — 11 files, 150 tests |
+| `pnpm build` | Pass — production build (one pre-existing Turbopack tracing warning) |
+| `pnpm exec playwright test` | Pass — 18 tests (1 setup + 17 Chromium) |
+| HTTP acceptance | Pass — 28/28 checks against the production build (see `docs/TESTING_REPORT.md`) |
+| Worker + live scans | Pass — combined `pnpm start` launched web + worker; `example.com`, `iana.org` and `wikipedia.org` scanned with HTTP 200 / `success` |
 | Screenshots | 60 PNGs at 1440/1024/390, light/dark |
 | Live discovery | Nominatim POI index returned real records in 1.5–3.8 s for Lisbon dentists (30), Berlin cafes (20), Karachi restaurants (25) and Madrid law firms (19); honest combined error covered by tests |
 | Live map | Nominatim geocode returned Lisbon bounds; Leaflet loaded OSM tiles with no console errors |
@@ -262,6 +264,48 @@ naming real companies. Live Groq checks returned advice in 686 ms, a city clarif
 411 ms and a valid Berlin cafe plan in 376 ms. Unit tests cover all three intents and
 history forwarding; the Playwright suite checks that an advice reply renders without
 “Apply” buttons.
+
+### Scans stayed queued because only the web app was started
+
+Symptom: pressing "Scan website" left the job at `queued` forever. Reproduction showed
+the web app alone was running; pg-boss had no connected worker, so nothing consumed
+`scan.business`.
+
+Fix: `pnpm dev` and `pnpm start` now launch the web app and the jobs worker together via
+`scripts/stack.ts` (standalone `dev:web`, `start:web`, `worker` and `worker:once` remain).
+The app detects worker heartbeats from pg-boss's `instance` table, which is populated by
+running workers. `/api/scans`, single and bulk scan responses expose `workerOnline`, and
+the Scans page, lead views and the app shell show an honest "Automation worker offline"
+banner with the start command instead of implying the scan is progressing. Jobs are never
+dropped; they resume when a worker connects. A pure parser (`parseWorkerHealth`) has
+unit tests, and a Playwright check asserts the banner is absent while the combined stack
+is running. Verified live: after the first heartbeat, `/api/scans` returned
+`workerOnline: true` and queued scans completed.
+
+### Live scans failed on real websites
+
+Symptom: even with the worker running, scans of public sites returned `unreachable` with
+HTTP 400 or 403. The SSRF protection resolved the hostname, then replaced the URL host
+with the validated IP and set a `Host` header manually. undici treats `Host` as a
+forbidden header, so the request arrived with the IP as the hostname; virtual-hosted
+servers rejected it.
+
+Fix: the request URL now keeps the original hostname (preserving the `Host` header and
+TLS SNI), while a custom `connect.lookup` pins the socket to the address that passed SSRF
+validation. A regression test asserts the fixture server receives the original hostname,
+and live scans of `example.com`, `iana.org` and `wikipedia.org` returned HTTP 200 with
+`success`.
+
+### Undo did not reopen the resolved duplicate
+
+Symptom: merging a duplicate pair, then undoing the merge restored the business but the
+pair did not return to the review queue. The merge snapshot did not record which
+candidate rows the merge resolved.
+
+Fix: the merge snapshot now stores those candidate ids, and undo sets them back to
+`pending` with `resolvedAt`/`resolvedBy` cleared. Older snapshots without the field still
+undo business data safely. The HTTP acceptance run now merges and undoes a seeded pair
+and asserts that the pair reappears.
 
 ## Decision log (abbreviated)
 

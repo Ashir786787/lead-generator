@@ -3,6 +3,14 @@
 These are deliberate boundaries or environment constraints, not hidden defects. Where a
 limitation affects a user decision, the UI is expected to say so honestly.
 
+**The jobs worker must be running.** Website scans, imports and score recalculation are
+queued through pg-boss and only progress while a worker is connected. `pnpm dev` and
+`pnpm start` launch the web app and worker together; if you use `pnpm dev:web` or
+`pnpm start:web`, also run `pnpm worker`. When no worker heartbeat is visible the app
+shows an "Automation worker offline" banner and jobs remain queued rather than failing
+silently. pg-boss writes a heartbeat roughly every 30 seconds, so the banner can appear
+briefly right after a restart before the first heartbeat lands.
+
 ## Scanning
 
 1. **No headless browser.** The scanner reads server-rendered HTML. A chat widget or

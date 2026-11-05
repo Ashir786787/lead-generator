@@ -3,6 +3,7 @@ import { z } from "zod";
 import { apiRoute } from "@/lib/api/route";
 import { getWorkspaceContext } from "@/lib/auth/session";
 import { listScanJobs, queueScans } from "@/lib/scan/service";
+import { getWorkerHealth, isScanWorkerOnline } from "@/lib/jobs/health";
 import { checkRateLimit } from "@/lib/api/rate-limit";
 
 export const runtime = "nodejs";
@@ -26,6 +27,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const raw = await request.json().catch(() => ({}));
     const body = bodySchema.parse(raw);
     const results = await queueScans(ctx, [id], Boolean(body.force));
-    return NextResponse.json({ results }, { status: 202 });
+    const workerOnline = isScanWorkerOnline(await getWorkerHealth());
+    return NextResponse.json({ results, workerOnline }, { status: 202 });
   });
 }

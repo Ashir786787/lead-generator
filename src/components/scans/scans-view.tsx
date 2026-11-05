@@ -103,6 +103,17 @@ export function ScansView({ initial, initialSummary }: { initial: ScanJobSummary
         }
       />
 
+      {!summary.workerOnline ? (
+        <div className="mb-5">
+          <InlineAlert tone="warning" title="Scan worker is offline">
+            New scans stay queued until the automation worker is running. Start it with <code>pnpm worker</code> in a
+            second terminal, or stop this server and run <code>pnpm dev</code> / <code>pnpm start</code>, which now
+            launches the web app and the worker together. Queued scans are kept and start automatically when the worker
+            connects.
+          </InlineAlert>
+        </div>
+      ) : null}
+
       <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard label="Queued" value={formatNumber(summary.queued)} icon={<Clock />} hint="Waiting for the worker" />
         <StatCard label="Running" value={formatNumber(summary.running)} icon={<Loader2 />} hint="Pages being inspected" />

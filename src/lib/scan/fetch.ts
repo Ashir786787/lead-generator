@@ -1,3 +1,4 @@
+import type { LookupFunction } from "node:net";
 import { Agent, fetch as undiciFetch } from "undici";
 import { env } from "@/lib/env";
 import { sleep } from "@/lib/utils";
@@ -34,11 +35,31 @@ async function waitForHost(host: string): Promise<void> {
   if (slot > now) await sleep(slot - now);
 }
 
-function pinnedUrl(url: URL, address: string): URL {
-  const pinned = new URL(url.toString());
-  const hostPart = address.includes(":") ? `[${address}]` : address;
-  pinned.host = url.port ? `${hostPart}:${url.port}` : hostPart;
-  return pinned;
+/**
+ * Keep the request URL (and therefore the Host header and TLS SNI) pointing at
+ * the real hostname while forcing the socket to the address we already
+ * validated. Replacing the URL host with the IP would make virtual-hosted
+ * servers answer 400/403 because the Host header no longer matches.
+ */
+function pinnedLookup(address: string, family: 4 | 6): LookupFunction {
+  const lookup = (
+    _hostname: string,
+    options: number | { all?: boolean } | ((...args: unknown[]) => void),
+    callback?: (
+      error: NodeJS.ErrnoException | null,
+      result: string | Array<{ address: string; family: number }>,
+      resolvedFamily?: number,
+    ) => void,
+  ): void => {
+    const done = typeof options === "function" ? (options as typeof callback) : callback;
+    if (!done) throw new Error("DNS lookup callback is missing.");
+    if (typeof options === "object" && options !== null && options.all) {
+      done(null, [{ address, family }]);
+      return;
+    }
+    done(null, address, family);
+  };
+  return lookup as unknown as LookupFunction;
 }
 
 function isHtml(contentType: string | null): boolean {
@@ -85,6 +106,7 @@ async function requestOnce(url: URL): Promise<RawFetchResult> {
         timeout: env.scan.connectTimeoutMs,
         servername: url.protocol === "https:" ? target.hostname : undefined,
         rejectUnauthorized: true,
+        lookup: pinnedLookup(entry.address, entry.family),
       },
       headersTimeout: env.scan.connectTimeoutMs,
       bodyTimeout: env.scan.totalTimeoutMs,
@@ -92,13 +114,12 @@ async function requestOnce(url: URL): Promise<RawFetchResult> {
     });
     try {
       await waitForHost(target.hostname);
-      const response = await undiciFetch(pinnedUrl(url, entry.address), {
+      const response = await undiciFetch(url, {
         method: "GET",
         redirect: "manual",
         dispatcher: agent,
         signal: AbortSignal.timeout(env.scan.totalTimeoutMs),
         headers: {
-          Host: url.host,
           "User-Agent": env.scan.userAgent,
           Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
           "Accept-Language": "en;q=0.8",

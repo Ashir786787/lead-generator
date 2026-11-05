@@ -5,6 +5,7 @@ import type { WorkspaceContext } from "@/lib/auth/session";
 import { conflict, notFound } from "@/lib/api/errors";
 import { publishEvent } from "@/lib/events/bus";
 import { sendJob, JOB_NAMES } from "@/lib/jobs/boss";
+import { getWorkerHealth, isScanWorkerOnline } from "@/lib/jobs/health";
 import { env } from "@/lib/env";
 
 export interface QueuedScan {
@@ -163,8 +164,9 @@ export async function scanQueueSummary(ctx: WorkspaceContext): Promise<{
   running: number;
   needsReview: number;
   neverChecked: number;
+  workerOnline: boolean;
 }> {
-  const [jobs, neverChecked, needsReview] = await Promise.all([
+  const [jobs, neverChecked, needsReview, worker] = await Promise.all([
     db
       .select({
         queued: sql<number>`count(*) filter (where ${scanJobs.status} = 'queued')`,
@@ -206,12 +208,14 @@ export async function scanQueueSummary(ctx: WorkspaceContext): Promise<{
           ]),
         ),
       ),
+    getWorkerHealth(),
   ]);
   return {
     queued: Number(jobs[0]?.queued ?? 0),
     running: Number(jobs[0]?.running ?? 0),
     needsReview: Number(needsReview[0]?.value ?? 0),
     neverChecked: Number(neverChecked[0]?.value ?? 0),
+    workerOnline: isScanWorkerOnline(worker),
   };
 }
 

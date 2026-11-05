@@ -84,10 +84,18 @@ pnpm db:migrate
 cp .env.example .env
 #    At minimum set BETTER_AUTH_SECRET to a long random value.
 
-# 4. Run the app and the worker in separate terminals
-pnpm dev       # http://localhost:3000
+# 4. Run the app and the worker together
+pnpm dev       # http://localhost:3000, also starts the jobs worker
+
+# Prefer separate terminals? Run the web app and worker independently:
+pnpm dev:web
 pnpm worker
 ```
+
+Website scans, imports and score recalculation are processed by the pg-boss worker. The
+combined `dev`/`start` commands launch it for you; if you use `dev:web` or `start:web` on
+their own, start `pnpm worker` too. The app shows an "Automation worker offline" banner
+when no worker heartbeat is visible, and queued jobs resume as soon as one connects.
 
 On first run the database has zero users. Open `http://localhost:3000/setup` to create
 the owner account. After that, self-service signup is disabled unless
@@ -109,8 +117,10 @@ touches an owner workspace. Run it again at any time to reset the demo.
 
 | Script | Purpose |
 | --- | --- |
-| `pnpm dev` | Next.js dev server |
-| `pnpm build` / `pnpm start` | Production build / server |
+| `pnpm dev` | Next.js dev server + jobs worker |
+| `pnpm dev:web` | Next.js dev server only (start `pnpm worker` too) |
+| `pnpm build` / `pnpm start` | Production build / server + jobs worker |
+| `pnpm start:web` | Production server only (start `pnpm worker` too) |
 | `pnpm worker` | Background worker (imports, scans, exports, scoring, healthcheck) |
 | `pnpm typecheck` | `tsc --noEmit` |
 | `pnpm lint` | ESLint |
@@ -219,8 +229,9 @@ They are generated against the production build with `pnpm screenshots` after
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md) — layers, data model, flows, safety controls
-- [Progress](docs/PROGRESS.md) — phase gates, test counts, acceptance evidence
+- [Architecture](docs/ARCHITECTURE.md) - layers, data model, flows, safety controls
+- [Testing report](docs/TESTING_REPORT.md) - full-app audit, pass/fail matrix, bugs fixed
+- [Progress](docs/PROGRESS.md) - phase gates, test counts, acceptance evidence
 - [Audit](docs/AUDIT.md) — requirement-by-requirement status
 - [Questions](docs/QUESTIONS.md) — missing inputs and assumptions
 - [Known limitations](docs/KNOWN_LIMITATIONS.md)

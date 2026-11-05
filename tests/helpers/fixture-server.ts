@@ -33,6 +33,12 @@ const INDEX_HTML = `<!doctype html>
 const ABOUT_HTML = `<!doctype html><html lang="en"><head><title>About</title></head>
 <body><p>Our story.</p></body></html>`;
 
+/** Exposes the Host header the fixture server actually received. */
+function hostHtml(request: http.IncomingMessage): string {
+  return `<!doctype html><html lang="en"><head><title>Host</title></head>
+<body><p>host=${request.headers.host ?? ""}</p></body></html>`;
+}
+
 /**
  * Start the fixture site on an ephemeral loopback port.
  *
@@ -65,6 +71,9 @@ export async function startFixtureServer(): Promise<FixtureServer> {
         return;
       case "/about":
         html(ABOUT_HTML);
+        return;
+      case "/host":
+        html(hostHtml(request));
         return;
       case "/private":
         html("<html><body>Members only</body></html>");

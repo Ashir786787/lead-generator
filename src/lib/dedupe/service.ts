@@ -126,6 +126,11 @@ interface SerializedBusiness {
 interface MergeSnapshot {
   business: SerializedBusiness;
   filledFields: string[];
+  /**
+   * Duplicate candidates that this merge resolved. Undo reopens them so the
+   * reviewer can decide again; older snapshots may not have the field.
+   */
+  resolvedCandidateIds?: string[];
   keptBefore: {
     contactIds: string[];
     sourceIds: string[];
@@ -359,6 +364,20 @@ export async function mergeBusinesses(
       .set({ mergedIntoId: keptId, archivedAt: new Date(), updatedAt: new Date() })
       .where(and(eq(businesses.workspaceId, ctx.workspaceId), eq(businesses.id, mergedId)));
 
+    const pendingCandidates = await tx
+      .select({ id: duplicateCandidates.id })
+      .from(duplicateCandidates)
+      .where(
+        and(
+          eq(duplicateCandidates.workspaceId, ctx.workspaceId),
+          eq(duplicateCandidates.status, "pending"),
+          or(
+            eq(duplicateCandidates.businessAId, mergedId),
+            eq(duplicateCandidates.businessBId, mergedId),
+          ),
+        ),
+      );
+
     await tx
       .update(duplicateCandidates)
       .set({ status: "merged", resolvedAt: new Date(), resolvedBy: ctx.user.id })
@@ -376,6 +395,7 @@ export async function mergeBusinesses(
     const snapshot: MergeSnapshot = {
       business: JSON.parse(JSON.stringify(merged)),
       filledFields,
+      resolvedCandidateIds: pendingCandidates.map((row) => row.id),
       keptBefore: {
         contactIds: keptContacts.map((row) => row.id),
         sourceIds: keptSources.map((row) => row.id),
@@ -475,6 +495,18 @@ export async function undoLastMerge(ctx: ActorContext): Promise<{ mergeId: strin
         updatedAt: new Date(),
       })
       .where(and(eq(businesses.workspaceId, ctx.workspaceId), eq(businesses.id, mergedId)));
+
+    if (snapshot.resolvedCandidateIds?.length) {
+      await tx
+        .update(duplicateCandidates)
+        .set({ status: "pending", resolvedAt: null, resolvedBy: null })
+        .where(
+          and(
+            eq(duplicateCandidates.workspaceId, ctx.workspaceId),
+            inArray(duplicateCandidates.id, snapshot.resolvedCandidateIds),
+          ),
+        );
+    }
 
     for (const raw of snapshot.merged.contacts) {
       const contact = raw as Record<string, unknown>;

@@ -22,6 +22,7 @@ import { authClient } from "@/lib/auth/client";
 import { apiFetch, errorMessage } from "@/lib/client/api";
 import { useLiveEvents } from "@/lib/client/hooks";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { InlineAlert } from "@/components/form";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -57,11 +58,13 @@ export function AppShell({
   user,
   workspace,
   workspaces,
+  workerOnline = true,
   children,
 }: {
   user: ShellUser;
   workspace: ShellWorkspace;
   workspaces: WorkspaceSummary[];
+  workerOnline?: boolean;
   children: React.ReactNode;
 }) {
   const pathname = usePathname();
@@ -277,7 +280,21 @@ export function AppShell({
           </span>
           <ThemeToggle compact />
         </header>
-        <main className="mx-auto w-full max-w-[1500px] px-4 pb-16 pt-6 sm:px-6 lg:px-8">{children}</main>
+        <main className="mx-auto w-full max-w-[1500px] px-4 pb-16 pt-6 sm:px-6 lg:px-8">
+          {!workerOnline ? (
+            <div className="mb-5">
+              <InlineAlert
+                tone="warning"
+                title="Automation worker offline"
+              >
+                Website scans, imports and score recalculation stay queued until a worker is running. Start one with{" "}
+                <code>pnpm worker</code>, or run <code>pnpm dev</code> / <code>pnpm start</code> to launch the web app
+                and worker together. Nothing is lost: queued jobs resume when the worker connects.
+              </InlineAlert>
+            </div>
+          ) : null}
+          {children}
+        </main>
       </div>
     </div>
   );

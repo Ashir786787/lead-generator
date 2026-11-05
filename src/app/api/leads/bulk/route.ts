@@ -4,6 +4,7 @@ import { apiRoute } from "@/lib/api/route";
 import { getWorkspaceContext } from "@/lib/auth/session";
 import { bulkAddTag, bulkArchive, bulkSetStatus } from "@/lib/data/mutations";
 import { queueScans } from "@/lib/scan/service";
+import { getWorkerHealth, isScanWorkerOnline } from "@/lib/jobs/health";
 import { PIPELINE_STATUSES } from "@/lib/constants";
 import { checkRateLimit } from "@/lib/api/rate-limit";
 
@@ -47,6 +48,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ affected: await bulkArchive(ctx, body.ids) });
     }
     const results = await queueScans(ctx, body.ids, Boolean(body.force));
-    return NextResponse.json({ results }, { status: 202 });
+    const workerOnline = isScanWorkerOnline(await getWorkerHealth());
+    return NextResponse.json({ results, workerOnline }, { status: 202 });
   });
 }

@@ -210,13 +210,16 @@ export function LeadDetailView({ initial, timezone }: { initial: LeadDetail; tim
   async function queueScan() {
     setScanning(true);
     try {
-      const result = await apiFetch<{ results: Array<{ scanJobId: string | null; reason?: string }> }>(
-        `/api/leads/${lead.id}/scan`,
-        { method: "POST", body: JSON.stringify({}) },
-      );
+      const result = await apiFetch<{
+        results: Array<{ scanJobId: string | null; reason?: string }>;
+        workerOnline?: boolean;
+      }>(`/api/leads/${lead.id}/scan`, { method: "POST", body: JSON.stringify({}) });
       const item = result.results[0];
-      if (item?.scanJobId) toast.success("Website scan queued.");
-      else if (item?.reason === "no_website") toast.error("This lead has no website to scan.");
+      if (item?.scanJobId && result.workerOnline === false) {
+        toast.warning("Scan queued, but the scan worker is offline. Start it with pnpm worker.");
+      } else if (item?.scanJobId) {
+        toast.success("Website scan queued.");
+      } else if (item?.reason === "no_website") toast.error("This lead has no website to scan.");
       else if (item?.reason === "already_running") toast.info("A scan is already running.");
       else toast.error("Could not queue this scan.");
       await scansQuery.refetch();

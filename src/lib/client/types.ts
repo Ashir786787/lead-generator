@@ -30,4 +30,5 @@ export interface ScanSummary {
   running: number;
   needsReview: number;
   neverChecked: number;
+  workerOnline: boolean;
 }

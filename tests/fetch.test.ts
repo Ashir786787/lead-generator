@@ -1,4 +1,5 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import dns from "node:dns/promises";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { startFixtureServer, type FixtureServer } from "./helpers/fixture-server";
 
 // Must be set before the fetcher module (and therefore `src/lib/env.ts`) loads.
@@ -25,6 +26,20 @@ describe("fetchPage against a loopback fixture site", () => {
     expect(page.contentType).toBe("text/html");
     expect(page.body).toContain("Fixture Dental Studio");
     expect(page.fromCache).toBe(false);
+  });
+
+  it("keeps the original hostname in the Host header while connecting to the validated IP", async () => {
+    const port = new URL(server.url).port;
+    const lookup = vi
+      .spyOn(dns, "lookup")
+      .mockResolvedValue([{ address: "127.0.0.1", family: 4 }] as never);
+    try {
+      const page = await fetchPage(`http://fixture.test:${port}/host`);
+      expect(page.failure).toBeNull();
+      expect(page.body).toContain(`host=fixture.test:${port}`);
+    } finally {
+      lookup.mockRestore();
+    }
   });
 
   it("obeys robots.txt disallow rules", async () => {
