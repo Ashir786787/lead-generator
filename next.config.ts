@@ -5,6 +5,19 @@ const isDev = process.env.NODE_ENV !== "production";
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   serverExternalPackages: ["pg", "pg-boss", "pino", "pino-pretty", "yauzl", "embedded-postgres"],
+  // The importer resolves stored upload paths at runtime, so Turbopack cannot
+  // know which files a server function reads. Keep project data, docs and test
+  // artefacts out of the server trace so Vercel functions stay small.
+  outputFileTracingExcludes: {
+    "/*": [
+      "./.data/**/*",
+      "./docs/**/*",
+      "./tests/**/*",
+      "./scripts/**/*",
+      "./playwright-report/**/*",
+      "./test-results/**/*",
+    ],
+  },
   // Playwright and local checks reach the dev server by IP; HMR rejects that
   // origin unless it is listed explicitly.
   allowedDevOrigins: ["127.0.0.1", "localhost"],

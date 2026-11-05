@@ -5,6 +5,7 @@ import { env } from "@/lib/env";
 import { safeFilename } from "@/lib/utils";
 
 export const storageRoot = path.resolve(env.storageDir);
+const projectRoot = process.cwd();
 
 export async function ensureStorage(): Promise<void> {
   await fs.mkdir(path.join(storageRoot, "uploads"), { recursive: true });
@@ -42,7 +43,10 @@ export async function saveUpload(
 
 /** Resolve a stored path, refusing anything outside the storage directory. */
 export function resolveStoredPath(storedPath: string): string {
-  const absolute = path.isAbsolute(storedPath) ? storedPath : path.resolve(process.cwd(), storedPath);
+  const absolute = path.isAbsolute(storedPath)
+    ? storedPath
+    : // Paths come from stored import records, so this is intentionally dynamic.
+      path.resolve(/*turbopackIgnore: true*/ projectRoot, storedPath);
   const relative = path.relative(storageRoot, absolute);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     throw new Error("Refusing to read a file outside the storage directory.");
