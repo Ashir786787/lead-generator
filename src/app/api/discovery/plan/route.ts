@@ -12,7 +12,7 @@ const planSchema = z.object({
   prompt: z
     .string()
     .trim()
-    .min(3, "Describe the businesses and location you want.")
+    .min(3, "Ask for leads or for guidance on choosing them.")
     .max(600, "Keep the request under 600 characters."),
   planner: z.enum(["auto", "gemini", "grok", "groq"]).default("auto"),
 });

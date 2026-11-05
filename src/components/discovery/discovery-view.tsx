@@ -84,6 +84,7 @@ interface DiscoveryResult {
 }
 
 interface DiscoveryPlan {
+  intent: "search" | "advice";
   planner: "gemini" | "grok" | "groq";
   model: string;
   provider: ProviderId;
@@ -92,6 +93,7 @@ interface DiscoveryPlan {
   categories: string[];
   limit: number;
   reasoning: string;
+  answer: string;
   notes: string[];
 }
 
@@ -129,7 +131,8 @@ interface ChatEntry {
 const CHAT_EXAMPLES = [
   "Dentists in Lisbon, Portugal",
   "Cafes in Berlin",
-  "Gyms in Karachi, Pakistan",
+  "Which kinds of businesses are good leads?",
+  "How does the lead score work?",
 ];
 
 export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
@@ -242,9 +245,13 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
       setChat((current) =>
         current.map((entry) => (entry.id === entryId ? { ...entry, plan: response.plan } : entry)),
       );
-      toast.success(
-        `Plan ready: ${response.plan.categories.length} categor${response.plan.categories.length === 1 ? "y" : "ies"} in ${response.plan.city}.`,
-      );
+      if (response.plan.intent === "advice") {
+        toast.success("The assistant replied with guidance.");
+      } else {
+        toast.success(
+          `Plan ready: ${response.plan.categories.length} categor${response.plan.categories.length === 1 ? "y" : "ies"} in ${response.plan.city}.`,
+        );
+      }
     } catch (error) {
       const message = errorMessage(error);
       setChat((current) =>
@@ -350,14 +357,14 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
       <PageHeader
         eyebrow="Live sources"
         title="Discovery"
-        description="Describe who you want, preview the area on a real map, and import live businesses from public sources. AI only plans the search — it never invents leads."
+        description="Describe who you want, preview the area on a real map, and import live businesses from public sources. AI plans searches or gives guidance — it never invents leads."
       />
 
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1.55fr)_minmax(0,1fr)]">
         <div className="space-y-5">
           <SectionCard
             title="AI search assistant"
-            description="Chat in plain language. The assistant only plans filters; every business still comes from a live source."
+            description="Ask for leads in a city, or ask how to choose the right ones. The assistant can plan a live search or give general guidance; every business still comes from a live source."
             actions={
               <Badge variant={anyPlannerAvailable ? "success" : "muted"}>
                 <Sparkles className="size-3" />
@@ -381,7 +388,11 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                         </span>
                         <div className="min-w-0 flex-1">
                           {entry.plan ? (
-                            <PlanPreview plan={entry.plan} running={running} onApply={applyPlan} />
+                            entry.plan.intent === "advice" ? (
+                              <AdviceBubble plan={entry.plan} />
+                            ) : (
+                              <PlanPreview plan={entry.plan} running={running} onApply={applyPlan} />
+                            )
                           ) : entry.error ? (
                             <div className="rounded-2xl rounded-tl-sm border border-danger/25 bg-danger-soft px-3 py-2 text-sm text-danger">
                               {entry.error}
@@ -401,9 +412,10 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                 </div>
               ) : (
                 <div className="rounded-xl border border-dashed border-border bg-muted/20 p-4">
-                  <p className="text-sm font-medium">Ask for the leads you want.</p>
+                  <p className="text-sm font-medium">Ask for leads, or ask for advice.</p>
                   <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                    For example: “Family dentists and orthodontists in Lisbon, Portugal — about 50 leads.”
+                    For example: “Family dentists and orthodontists in Lisbon, Portugal — about 50 leads.” Or: “What
+                    kinds of businesses are good leads for a web design studio?”
                   </p>
                   <div className="mt-3 flex flex-wrap gap-1.5">
                     {CHAT_EXAMPLES.map((example) => (
@@ -431,10 +443,12 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                     }
                   }
                 }}
-                placeholder={'e.g. "Family dentists and orthodontists in Lisbon, Portugal — about 50 leads."'}
+                placeholder={
+                  'e.g. "Family dentists in Lisbon, Portugal" or "Which businesses are good leads?"'
+                }
                 maxLength={600}
                 rows={3}
-                aria-label="Describe the businesses you want to find"
+                aria-label="Ask for leads or for advice"
               />
               <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
                 <Field label="Planner" htmlFor="discovery-planner" className="sm:max-w-[220px] sm:flex-1">
@@ -479,8 +493,9 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                 </p>
               ) : (
                 <p className="text-xs leading-relaxed text-muted-foreground">
-                  Press Enter to send, Shift+Enter for a new line. The assistant cannot return businesses, phone
-                  numbers, emails or websites — those always come from the live source.
+                  Press Enter to send, Shift+Enter for a new line. The assistant can plan a search or explain how to
+                  use the app, but it cannot return businesses, phone numbers, emails or websites — those always come
+                  from the live source.
                 </p>
               )}
             </div>
@@ -705,8 +720,8 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
               <p className="mt-2 text-sm font-medium">Live results, not sample data</p>
               <p className="mx-auto mt-1 max-w-lg text-sm leading-relaxed text-muted-foreground">
                 Discovery returns whatever the public source actually has for your query. If a source is unavailable,
-                it stays unavailable instead of showing invented businesses. AI plans filters; it is never treated as a
-                business database.
+                it stays unavailable instead of showing invented businesses. AI plans filters or gives guidance; it is
+                never treated as a business database.
               </p>
             </div>
           )}
@@ -806,8 +821,8 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
                 contributors, available under the ODbL. Geocoding uses Nominatim.
               </li>
               <li className="flex items-start gap-1.5">
-                <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-success" /> Gemini, Grok and Groq only turn your
-                words into search filters. They are not lead sources and cannot add businesses.
+                <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-success" /> Gemini, Grok and Groq plan
+                searches or give general guidance. They are not lead sources and cannot add businesses.
               </li>
               <li className="flex items-start gap-1.5">
                 <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-success" /> Searches and geocoding are rate-limited
@@ -821,6 +836,24 @@ export function DiscoveryView({ initial }: { initial: DiscoveryPayload }) {
           </div>
         </aside>
       </div>
+    </div>
+  );
+}
+
+function AdviceBubble({ plan }: { plan: DiscoveryPlan }) {
+  return (
+    <div className="rounded-lg border border-border/70 bg-card px-3 py-2.5">
+      <p className="whitespace-pre-line text-sm leading-relaxed">{plan.answer}</p>
+      <p className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[11px] text-muted-foreground">
+        <span>Guidance only — no businesses came from the assistant.</span>
+        <span aria-hidden="true">·</span>
+        <span>
+          {plan.planner} · {plan.model}
+        </span>
+      </p>
+      <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+        To run a real search, name a business type and a city. The manual form below works too.
+      </p>
     </div>
   );
 }

@@ -105,14 +105,17 @@ limitation affects a user decision, the UI is expected to say so honestly.
 
 ## AI planning and maps
 
-39. **Gemini, xAI Grok and Groq are optional planners, not data sources.** They receive
-    the user's description and return only city, an optional country, categories, a limit
-    and a target provider. They cannot add businesses, contacts or websites. Without a key,
-    the assistant says so and manual discovery remains available.
-40. **Plans can be imperfect.** The app validates and normalises the model's output
-    (category aliases, 1–8 categories, 1–200 results) and rejects a missing city, but a
-    plan may still be too broad or miss a niche category. Review the filters before
-    running. A missing country is accepted and searched as a city name.
+39. **Gemini, xAI Grok and Groq are optional assistants, not data sources.** They receive
+    the user's message and return either a validated search plan (`intent`, city, an
+    optional country, categories, a limit, a target provider) or plain-text guidance in
+    `answer`. They cannot add businesses, contacts or websites. Without a key, the
+    assistant says so and manual discovery remains available.
+40. **Plans and advice can be imperfect.** The app validates and normalises the model's
+    output (category aliases, 1-8 categories, 1-200 results). A missing city or an
+    unsupported category produces a clarification reply, not a search. Advice is general:
+    a plan may still be too broad or miss a niche category, and guidance cannot know a
+    specific business's site or needs. Review the filters before running. A missing country
+    is accepted and searched as a city name.
 41. **Public Overpass is a shared, best-effort service.** It can take 30–60 seconds, return
     502 "at capacity", time out, or rate-limit. Discovery therefore reads the Nominatim POI
     index first and only tries Overpass when that index has no matches. Both are free,
@@ -133,9 +136,13 @@ limitation affects a user decision, the UI is expected to say so honestly.
     keys during this build, newer Flash models can return 503 under load, and Groq's
     account-specific model list varies. Defaults are configurable via `GEMINI_MODEL`,
     `GROK_MODEL` and `GROQ_MODEL`; `auto` falls back to another configured planner and says
-    so in the chat reply. A user-input error such as a missing city stops the chain instead
-    of retrying every model, and an explicitly selected planner that fails reports the
-    upstream error rather than silently switching.
+    so in the chat reply. General guidance and missing-city clarifications are returned
+    immediately, so they do not trigger a provider retry. An explicitly selected planner
+    that fails reports the upstream error rather than silently switching.
+46. **Advice is not verified business intelligence.** The assistant can suggest categories,
+    explain how scoring works and describe honest scan labels, but it cannot know whether a
+    particular business has a website, chatbot, phone number or need. Chat replies are
+    capped at 1,600 characters and should be treated as general guidance, not lead data.
 
 ## Product boundary
 

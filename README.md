@@ -19,8 +19,9 @@ human reviews and works through.
   error reporting, duplicate detection, undo-safe merges and cancellation.
 - **Discover** businesses from OpenStreetMap (Nominatim POI index, with Overpass as a
   backup) and, when a key is present, Google Places. A chat-style AI assistant powered by
-  Gemini, xAI Grok or Groq turns plain language into validated search filters - the models
-  never supply leads. A Leaflet/OpenStreetMap map previews the search area and plots real
+  Gemini, xAI Grok or Groq turns plain language into validated search filters, or answers
+  general questions about choosing leads and using the app - the models never supply
+  leads. A Leaflet/OpenStreetMap map previews the search area and plots real
   result coordinates. Providers are honest about availability; there are no placeholder
   results.
 - **Scan** public websites with a hardened fetcher: SSRF/DNS-rebinding protection,
@@ -145,9 +146,9 @@ All variables are documented in [`.env.example`](.env.example). The most importa
 | `OVERPASS_CACHE_MINUTES` | `60` | In-memory cache for identical queries |
 | `GOOGLE_PLACES_API_KEY` | empty | Empty means the provider reports unavailable |
 | `GEOCODE_USER_AGENT` | scanner UA | Set a real contact for Nominatim in production |
-| `GEMINI_API_KEY` / `GEMINI_MODEL` | empty / `gemini-3.1-flash-lite` | Optional AI search planner |
-| `GROK_API_KEY` / `GROK_MODEL` | empty / `grok-4` | Optional xAI Grok planner |
-| `GROQ_API_KEY` / `GROQ_MODEL` | empty / `qwen/qwen3.8-27b` | Optional Groq Cloud planner (not xAI Grok) |
+| `GEMINI_API_KEY` / `GEMINI_MODEL` | empty / `gemini-3.1-flash-lite` | Optional AI search planner and guidance |
+| `GROK_API_KEY` / `GROK_MODEL` | empty / `grok-4` | Optional xAI Grok planner and guidance |
+| `GROQ_API_KEY` / `GROQ_MODEL` | empty / `qwen/qwen3.8-27b` | Optional Groq Cloud planner and guidance (not xAI Grok) |
 | `PG_BOSS_SCHEMA` | `pgboss` | Job queue schema |
 | `LOG_LEVEL` | `info` | pino level |
 
@@ -158,19 +159,25 @@ Production startup refuses to run with the development auth secret or with
 
 Discovery has two real sources: OpenStreetMap (no key) and Google Places (key required).
 Search `/discovery` manually, or chat with the AI assistant and let Gemini, xAI Grok or Groq
-produce a plan:
+help:
 
-1. The planner returns only `city`, an optional `country`, categories (1–8), a result limit
+1. Ask for a specific search, for example “dentists in Lisbon, Portugal”. The assistant
+   returns only `intent`, `city`, an optional `country`, categories (1-8), a result limit
    and a target provider. It has no schema fields for businesses, contacts or websites.
-2. The app validates the plan and shows the filters as a chat reply. A city is required; a
-   missing country is allowed and noted.
-3. Running the plan calls the live source, imports through the normal dedupe pipeline
+2. Ask a general question, for example “which kinds of businesses are good leads?” or
+   “how does the lead score work?”. The assistant replies with plain-text guidance in
+   `answer`. Advice never names a real business and is not a search plan.
+3. The app validates a search plan and shows the filters as a chat reply. A city is
+   required; a missing country is allowed and noted. If no city is given, or no supported
+   category matches, the assistant asks for that detail instead of producing an error.
+4. Running the plan calls the live source, imports through the normal dedupe pipeline
    and plots returned coordinates on the OpenStreetMap map.
 
 If no AI key is set, the assistant says so and manual discovery still works. `auto`
 prefers Groq for speed, then Gemini, then Grok, and transparently falls back if a planner
-fails (the chat reply shows which model was used). An invalid plan such as a missing city
-stops the chain and shows the reason instead of retrying every model.
+fails (the chat reply shows which model was used). General guidance and missing-city
+clarifications return immediately as chat replies, so `auto` never retries every provider
+for them.
 
 OpenStreetMap discovery reads the public Nominatim POI index with exact tag queries such as
 `[amenity=dentist]` inside the geocoded city box. It is free, keyless and normally answers

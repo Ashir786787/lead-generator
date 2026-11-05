@@ -70,18 +70,54 @@ describe("parsePlannerOutput", () => {
     expect(plan.notes.join(" ")).toMatch(/no country given/i);
   });
 
-  it("asks for a city instead of inventing one", () => {
-    expect(() =>
-      parsePlannerOutput(JSON.stringify({ city: "", country: "", categories: ["dentist"] })),
-    ).toThrow(/missing a city/i);
+  it("answers general questions with advice and no search filters", () => {
+    const reply = parsePlannerOutput(
+      JSON.stringify({
+        intent: "advice",
+        answer:
+          "Start with businesses that already pay for marketing and depend on inbound enquiries, such as dentists, clinics and law firms. A good lead is reachable and shows a gap you can help with.",
+        city: "",
+        country: "",
+        categories: [],
+      }),
+    );
+    expect(reply.intent).toBe("advice");
+    expect(reply.answer).toMatch(/dentists, clinics and law firms/i);
+    expect(reply.categories).toEqual([]);
+    expect(reply.city).toBe("");
+    expect(reply.answer).not.toMatch(/Lisbon/);
   });
 
-  it("rejects a plan with no supported categories", () => {
-    expect(() =>
-      parsePlannerOutput(
-        JSON.stringify({ city: "Lisbon", country: "Portugal", categories: ["spaceships"] }),
-      ),
-    ).toThrow(/business type/i);
+  it("falls back to useful guidance when advice has no text", () => {
+    const reply = parsePlannerOutput(
+      JSON.stringify({ intent: "advice", answer: "", city: "", categories: [] }),
+    );
+    expect(reply.intent).toBe("advice");
+    expect(reply.answer).toMatch(/tell me what you sell|business type/i);
+  });
+
+  it("asks for a city instead of inventing one", () => {
+    const reply = parsePlannerOutput(
+      JSON.stringify({ city: "", country: "", categories: ["dentist"] }),
+    );
+    expect(reply.intent).toBe("advice");
+    expect(reply.answer).toMatch(/which city/i);
+    expect(reply.answer).toMatch(/dentist/i);
+    expect(reply.city).toBe("");
+  });
+
+  it("guides the user when no supported category was given", () => {
+    const reply = parsePlannerOutput(
+      JSON.stringify({
+        city: "Lisbon",
+        country: "Portugal",
+        categories: ["spaceships"],
+      }),
+    );
+    expect(reply.intent).toBe("advice");
+    expect(reply.answer).toMatch(/business type/i);
+    expect(reply.answer).toMatch(/dentist|restaurant/i);
+    expect(reply.categories).toEqual([]);
   });
 
   it("rejects malformed output", () => {
@@ -211,7 +247,7 @@ describe("planDiscovery provider calls", () => {
     expect(body.model).toBe(env.groq.model);
   });
 
-  it("auto mode stops on an invalid plan instead of trying more providers", async () => {
+  it("auto mode answers a missing-city request without retrying other providers", async () => {
     (env.gemini as { apiKey: string }).apiKey = "test-gemini";
     (env.groq as { apiKey: string }).apiKey = "test-groq";
     const fetchMock = vi.fn().mockResolvedValue(
@@ -230,10 +266,47 @@ describe("planDiscovery provider calls", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(planDiscovery({ prompt: "dentists nearby", planner: "auto" })).rejects.toThrow(
-      /missing a city/i,
+    const reply = await planDiscovery({ prompt: "dentists nearby", planner: "auto" });
+
+    expect(reply.intent).toBe("advice");
+    expect(reply.answer).toMatch(/which city/i);
+    // Groq is first; the reply is valid guidance, so Gemini is never called.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns advice from the provider without building a plan", async () => {
+    (env.groq as { apiKey: string }).apiKey = "test-key";
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  intent: "advice",
+                  answer:
+                    "Think about businesses with repeat customers and a reason to invest in outreach, such as dentists, gyms and law firms. Tell me what you sell and I can narrow that down.",
+                  city: "",
+                  country: "",
+                  categories: [],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
     );
-    // Groq is first; the 400 stops the chain before Gemini is called.
+    vi.stubGlobal("fetch", fetchMock);
+
+    const reply = await planDiscovery({
+      prompt: "what kind of leads are helpful to find business",
+      planner: "groq",
+    });
+
+    expect(reply).toMatchObject({ intent: "advice", planner: "groq", city: "", categories: [] });
+    expect(reply.answer).toMatch(/dentists, gyms and law firms/i);
+    expect(reply.answer).not.toMatch(/[\w.-]+\.(com|net|org)/i);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
