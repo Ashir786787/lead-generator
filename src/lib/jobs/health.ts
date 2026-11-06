@@ -54,6 +54,14 @@ export function parseWorkerHealth(rows: WorkerInstanceRow[]): WorkerHealth {
 }
 
 export async function getWorkerHealth(): Promise<WorkerHealth> {
+  if (env.inlineJobs) {
+    // Work runs inside the request, so there is no worker heartbeat to look for.
+    return {
+      online: true,
+      queues: Object.values(JOB_NAMES).sort(),
+      heartbeatAt: new Date().toISOString(),
+    };
+  }
   try {
     const result = await pool.query<WorkerInstanceRow>(
       `select heartbeat_on, workers

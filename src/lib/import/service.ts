@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
+import { and, desc, eq, getTableColumns, isNotNull, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { importJobs, importRowErrors, workspaces } from "@/lib/db/schema";
 import type { WorkspaceContext } from "@/lib/auth/session";
@@ -21,6 +21,15 @@ export interface ImportPreviewResult {
   rowHint: number | null;
   duplicateOf: { id: string; filename: string; createdAt: string } | null;
 }
+
+/**
+ * Every import column except the (potentially large) base64 file payload.
+ * Listing imports must never load stored files into memory.
+ */
+const importSummaryColumns = {
+  ...getTableColumns(importJobs),
+  fileData: sql<string | null>`null`.as("file_data"),
+};
 
 function sanitiseMapping(input: unknown): ColumnMapping {
   if (!input || typeof input !== "object") return {};
@@ -48,17 +57,23 @@ export async function createImportPreview(
   if (!buffer.length) throw conflict("The uploaded file is empty.");
   const hash = hashBuffer(buffer);
   const stored = await saveUpload(ctx.workspaceId, file.name, buffer);
+  const storeInDatabase = env.uploadStorage === "database";
 
   let preview: FilePreview;
+  let rowHint: number | null;
   try {
     preview = await previewFile(stored.absolutePath, file.name);
+    rowHint = await countRowsHint(stored.absolutePath);
   } catch (error) {
     await fs.rm(stored.absolutePath, { force: true }).catch(() => undefined);
     throw conflict(error instanceof Error ? error.message : "Could not read this file.");
   }
 
   const mapping = guessMapping(preview.columns);
-  const rowHint = await countRowsHint(stored.absolutePath);
+  if (storeInDatabase) {
+    // The preview is finished; the durable copy below lives in PostgreSQL.
+    await fs.rm(stored.absolutePath, { force: true }).catch(() => undefined);
+  }
   const [duplicateOf] = await db
     .select({ id: importJobs.id, filename: importJobs.filename, createdAt: importJobs.createdAt })
     .from(importJobs)
@@ -81,7 +96,8 @@ export async function createImportPreview(
       origin: "import",
       filename: file.name.slice(0, 240),
       fileHash: hash,
-      storagePath: stored.storedPath,
+      storagePath: storeInDatabase ? null : stored.storedPath,
+      fileData: storeInDatabase ? buffer.toString("base64") : null,
       mapping,
       detectedColumns: preview.columns,
       status: "queued",
@@ -110,17 +126,43 @@ export async function startImport(
   importJobId: string,
   mappingInput: unknown,
   options: { force?: boolean } = {},
-): Promise<{ importJobId: string; queued: boolean; existingJobId?: string }> {
+): Promise<{
+  importJobId: string;
+  queued: boolean;
+  completed?: boolean;
+  status?: string;
+  existingJobId?: string;
+}> {
   const [job] = await db
-    .select()
+    .select({
+      status: importJobs.status,
+      startedAt: importJobs.startedAt,
+      mapping: importJobs.mapping,
+      mappingConfirmed: importJobs.mappingConfirmed,
+      fileHash: importJobs.fileHash,
+    })
     .from(importJobs)
     .where(and(eq(importJobs.workspaceId, ctx.workspaceId), eq(importJobs.id, importJobId)))
     .limit(1);
   if (!job) throw notFound("Import not found.");
-  if (job.status === "processing" || job.status === "queued" && job.mappingConfirmed) {
+  if (job.status === "completed") throw conflict("This import has already finished.");
+  // Inline requests can be cut off by the platform, leaving a job in
+  // "processing". There is no worker to resume it, so allow an explicit retry
+  // once the previous request is clearly gone.
+  if (
+    !env.inlineJobs &&
+    (job.status === "processing" || (job.status === "queued" && job.mappingConfirmed))
+  ) {
     throw conflict("This import is already queued or running.");
   }
-  if (job.status === "completed") throw conflict("This import has already finished.");
+  if (
+    env.inlineJobs &&
+    job.status === "processing" &&
+    job.startedAt &&
+    Date.now() - job.startedAt.getTime() < 5 * 60 * 1000
+  ) {
+    throw conflict("This import is already running.");
+  }
 
   const mapping = sanitiseMapping(mappingInput ?? job.mapping);
   if (!mapping.name) throw conflict("Map a column to “Business name” before starting the import.");
@@ -157,6 +199,19 @@ export async function startImport(
       error: null,
     })
     .where(and(eq(importJobs.workspaceId, ctx.workspaceId), eq(importJobs.id, importJobId)));
+
+  if (env.inlineJobs) {
+    // Serverless mode: run the import inside this request instead of waiting
+    // for a worker that cannot exist on the platform.
+    const { processImport } = await import("./process");
+    const processed = await processImport(ctx.workspaceId, importJobId);
+    return {
+      importJobId,
+      queued: false,
+      completed: processed.status === "completed",
+      status: processed.status,
+    };
+  }
 
   await sendJob(
     JOB_NAMES.importProcess,
@@ -215,7 +270,7 @@ function toSummary(row: typeof importJobs.$inferSelect, duplicateFile: boolean):
 
 export async function listImports(ctx: WorkspaceContext): Promise<ImportSummary[]> {
   const rows = await db
-    .select()
+    .select(importSummaryColumns)
     .from(importJobs)
     .where(eq(importJobs.workspaceId, ctx.workspaceId))
     .orderBy(desc(importJobs.createdAt))
@@ -241,7 +296,7 @@ export interface ImportDetail extends ImportSummary {
 
 export async function getImport(ctx: WorkspaceContext, importJobId: string): Promise<ImportDetail> {
   const [job] = await db
-    .select()
+    .select(importSummaryColumns)
     .from(importJobs)
     .where(and(eq(importJobs.workspaceId, ctx.workspaceId), eq(importJobs.id, importJobId)))
     .limit(1);
@@ -283,7 +338,7 @@ export async function cancelImport(ctx: WorkspaceContext, importJobId: string): 
 
 export async function deleteImport(ctx: WorkspaceContext, importJobId: string): Promise<void> {
   const [job] = await db
-    .select()
+    .select({ status: importJobs.status, storagePath: importJobs.storagePath })
     .from(importJobs)
     .where(and(eq(importJobs.workspaceId, ctx.workspaceId), eq(importJobs.id, importJobId)))
     .limit(1);

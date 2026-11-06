@@ -282,7 +282,13 @@ function UploadDialog({
     }
     setStarting(true);
     try {
-      const result = await apiFetch<{ importJobId: string; queued: boolean; existingJobId?: string }>(
+      const result = await apiFetch<{
+        importJobId: string;
+        queued: boolean;
+        completed?: boolean;
+        status?: string;
+        existingJobId?: string;
+      }>(
         `/api/imports/${preview.importJobId}/start`,
         { method: "POST", body: JSON.stringify({ mapping, force: forceValue }) },
       );
@@ -292,7 +298,13 @@ function UploadDialog({
         toast.info("This exact file and mapping was imported before.");
         return;
       }
-      toast.success("Import queued. Progress will appear on the next screen.");
+      if (result.status === "failed") {
+        toast.error("Import failed. Open the import to see the row errors.");
+      } else if (result.completed) {
+        toast.success("Import completed.");
+      } else {
+        toast.success("Import queued. Progress will appear on the next screen.");
+      }
       reset();
       onStarted(result.importJobId);
     } catch (error) {

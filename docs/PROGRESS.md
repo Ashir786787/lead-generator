@@ -307,6 +307,28 @@ Fix: the merge snapshot now stores those candidate ids, and undo sets them back 
 undo business data safely. The HTTP acceptance run now merges and undoes a seeded pair
 and asserts that the pair reappears.
 
+### Vercel serverless mode
+
+Vercel has no persistent worker or writable disk, so jobs stayed `queued` and uploads were
+lost between invocations. The app now supports an explicit inline mode (`INLINE_JOBS=true`,
+automatic when `VERCEL=1`):
+
+- `queueScans`, `startImport` and score recalculation run the work inside the originating
+  request instead of sending a pg-boss job. `getWorkerHealth` reports the queues as online
+  so the offline banner is not shown.
+- Uploaded files are stored as base64 in the new `import_jobs.file_data` column
+  (`UPLOAD_STORAGE=database`), materialized into `/tmp` only while parsing, and cleared
+  after a successful import. Listing imports explicitly excludes the payload column.
+- Long-running routes declare `maxDuration = 300`. Inline scans stop starting new work
+  after `INLINE_JOB_BUDGET_MS` (default 180 s) and mark the remainder failed with an
+  explanation instead of leaving them queued forever.
+- Migration `0001_smart_war_machine.sql` adds `file_data`.
+
+Verified locally with `INLINE_JOBS=true UPLOAD_STORAGE=database`: a CSV import completed
+inline (`completed`, 0 errors, `file_data` cleared), a fixture-site scan returned
+`success`, scoring returned `recalculated: true`, and `/api/scans` reported
+`workerOnline: true`. Normal worker mode remains the default.
+
 ## Decision log (abbreviated)
 
 - Local PostgreSQL runs through `embedded-postgres` on port 5433 because Docker and a

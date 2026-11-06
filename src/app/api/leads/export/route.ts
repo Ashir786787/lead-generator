@@ -6,6 +6,7 @@ import { checkRateLimit } from "@/lib/api/rate-limit";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 300;
 
 const schema = z.object({
   query: z.record(z.string(), z.string()).default({}),

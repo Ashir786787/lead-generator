@@ -3,6 +3,7 @@ import { openEventListener } from "@/lib/events/bus";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 300;
 
 /**
  * Server-sent events for this workspace only. The LISTEN connection filters by

@@ -75,11 +75,18 @@ export function ImportDetailView({ initial, timezone }: { initial: ImportDetail;
   async function retry() {
     setPending("retry");
     try {
-      const result = await apiFetch<{ queued: boolean; existingJobId?: string }>(`/api/imports/${detail.id}/start`, {
+      const result = await apiFetch<{
+        queued: boolean;
+        completed?: boolean;
+        status?: string;
+        existingJobId?: string;
+      }>(`/api/imports/${detail.id}/start`, {
         method: "POST",
         body: JSON.stringify({ mapping: detail.mapping, force: true }),
       });
       if (result.existingJobId) toast.info("A previous completed import already used this file and mapping.");
+      else if (result.status === "failed") toast.error("Import failed. Check the row errors below.");
+      else if (result.completed) toast.success("Import completed.");
       else toast.success("Import re-queued.");
       await detailQuery.refetch();
     } catch (error) {

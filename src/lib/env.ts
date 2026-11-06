@@ -17,10 +17,28 @@ function list(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
+const isVercel = process.env.VERCEL === "1" || Boolean(process.env.VERCEL_ENV);
+/**
+ * Serverless platforms have no long-lived worker process. In that mode jobs are
+ * executed inside the request that creates them, and uploads are kept in
+ * PostgreSQL because the filesystem is ephemeral.
+ */
+const inlineJobs = bool(process.env.INLINE_JOBS, isVercel);
+const uploadStorage =
+  process.env.UPLOAD_STORAGE === "database" || process.env.UPLOAD_STORAGE === "local"
+    ? process.env.UPLOAD_STORAGE
+    : inlineJobs
+      ? "database"
+      : "local";
+
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? "development",
   isProduction: process.env.NODE_ENV === "production",
   isTest: process.env.NODE_ENV === "test",
+  isVercel,
+  inlineJobs,
+  uploadStorage,
+  inlineJobBudgetMs: num(process.env.INLINE_JOB_BUDGET_MS, 180_000),
   appName: process.env.NEXT_PUBLIC_APP_NAME ?? "Lead Finder",
   appUrl: process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000",
   databaseUrl: process.env.DATABASE_URL ?? "postgres://leadfinder:leadfinder@127.0.0.1:5433/leadfinder",

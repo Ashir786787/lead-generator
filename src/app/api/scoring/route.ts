@@ -7,14 +7,32 @@ import {
   createProfileVersion,
   listProfiles,
   previewProfileImpact,
+  recalculateWorkspaceScores,
 } from "@/lib/score/service";
 import { scoreConfigSchema } from "@/lib/score/config";
 import { sendJob, JOB_NAMES } from "@/lib/jobs/boss";
 import { publishEvent } from "@/lib/events/bus";
 import { checkRateLimit } from "@/lib/api/rate-limit";
+import { env } from "@/lib/env";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 300;
+
+async function recalculate(workspaceId: string, userId: string): Promise<{ inline: boolean }> {
+  if (env.inlineJobs) {
+    await recalculateWorkspaceScores(workspaceId, async (done, total) => {
+      await publishEvent(workspaceId, "score.recalculated", { done, total });
+    });
+    return { inline: true };
+  }
+  await sendJob(
+    JOB_NAMES.scoreRecalculate,
+    { workspaceId, requestedBy: userId },
+    { retryLimit: 1 },
+  );
+  return { inline: false };
+}
 
 const postSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("preview"), config: scoreConfigSchema }),
@@ -42,28 +60,16 @@ export async function POST(request: Request) {
     }
     if (body.action === "save") {
       const profile = await createProfileVersion(ctx.workspaceId, body.config, ctx.user.id);
-      await sendJob(
-        JOB_NAMES.scoreRecalculate,
-        { workspaceId: ctx.workspaceId, requestedBy: ctx.user.id },
-        { retryLimit: 1 },
-      );
+      const result = await recalculate(ctx.workspaceId, ctx.user.id);
       await publishEvent(ctx.workspaceId, "score.recalculated", { scheduled: true });
-      return NextResponse.json({ profile, recalculating: true }, { status: 201 });
+      return NextResponse.json({ profile, recalculating: !result.inline }, { status: 201 });
     }
     if (body.action === "activate") {
       await activateProfile(ctx.workspaceId, body.profileId);
-      await sendJob(
-        JOB_NAMES.scoreRecalculate,
-        { workspaceId: ctx.workspaceId, requestedBy: ctx.user.id },
-        { retryLimit: 1 },
-      );
-      return NextResponse.json({ ok: true, recalculating: true });
+      const result = await recalculate(ctx.workspaceId, ctx.user.id);
+      return NextResponse.json({ ok: true, recalculating: !result.inline });
     }
-    await sendJob(
-      JOB_NAMES.scoreRecalculate,
-      { workspaceId: ctx.workspaceId, requestedBy: ctx.user.id },
-      { retryLimit: 1 },
-    );
-    return NextResponse.json({ ok: true, queued: true }, { status: 202 });
+    const result = await recalculate(ctx.workspaceId, ctx.user.id);
+    return NextResponse.json({ ok: true, queued: !result.inline, recalculated: result.inline }, { status: 202 });
   });
 }

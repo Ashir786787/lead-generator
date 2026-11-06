@@ -7,6 +7,7 @@ import { planDiscovery, plannerStatuses } from "@/lib/discovery/ai";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 120;
 
 const planSchema = z.object({
   prompt: z

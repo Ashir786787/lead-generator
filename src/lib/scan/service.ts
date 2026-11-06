@@ -1,4 +1,4 @@
-import { and, count, countDistinct, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, count, countDistinct, desc, eq, inArray, isNotNull, isNull, lt, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { businesses, scanJobs, scanResults } from "@/lib/db/schema";
 import type { WorkspaceContext } from "@/lib/auth/session";
@@ -12,6 +12,8 @@ export interface QueuedScan {
   businessId: string;
   scanJobId: string | null;
   reason?: "no_website" | "already_running" | "not_found";
+  /** Present when the scan ran inline (serverless mode). */
+  outcome?: string;
 }
 
 export async function queueScans(
@@ -31,6 +33,29 @@ export async function queueScans(
     .where(and(eq(businesses.workspaceId, ctx.workspaceId), inArray(businesses.id, ids)));
 
   const found = new Map(rows.map((row) => [row.id, row]));
+
+  if (env.inlineJobs) {
+    // A request killed by the platform can leave a scan "processing" forever.
+    // Clear stale rows so the lead can be scanned again.
+    const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
+    await db
+      .update(scanJobs)
+      .set({
+        status: "failed",
+        error: "An earlier inline scan did not finish before the request ended. Retry the scan.",
+        finishedAt: new Date(),
+        progress: 100,
+      })
+      .where(
+        and(
+          eq(scanJobs.workspaceId, ctx.workspaceId),
+          inArray(scanJobs.businessId, ids),
+          inArray(scanJobs.status, ["queued", "processing"]),
+          lt(scanJobs.createdAt, staleCutoff),
+        ),
+      );
+  }
+
   const active = await db
     .select({ businessId: scanJobs.businessId })
     .from(scanJobs)
@@ -42,6 +67,10 @@ export async function queueScans(
       ),
     );
   const activeSet = new Set(active.map((row) => row.businessId));
+
+  // Serverless requests have a hard duration cap, so inline work gets a budget
+  // and any remaining scans are marked failed with an honest explanation.
+  const inlineDeadline = env.inlineJobs ? Date.now() + env.inlineJobBudgetMs : Number.POSITIVE_INFINITY;
 
   const results: QueuedScan[] = [];
   for (const id of ids) {
@@ -72,12 +101,31 @@ export async function queueScans(
       results.push({ businessId: id, scanJobId: null, reason: "not_found" });
       continue;
     }
+    await publishEvent(ctx.workspaceId, "scan.queued", { businessId: id, scanJobId: job.id });
+
+    if (env.inlineJobs) {
+      if (Date.now() >= inlineDeadline) {
+        const message =
+          "The serverless request time limit was reached before this scan could run. Retry it in a smaller batch.";
+        await db
+          .update(scanJobs)
+          .set({ status: "failed", error: message, finishedAt: new Date(), progress: 100 })
+          .where(and(eq(scanJobs.workspaceId, ctx.workspaceId), eq(scanJobs.id, job.id)));
+        await publishEvent(ctx.workspaceId, "scan.failed", { scanJobId: job.id, message });
+        results.push({ businessId: id, scanJobId: job.id, outcome: "error" });
+        continue;
+      }
+      const { processScan } = await import("./process");
+      const outcome = await processScan(ctx.workspaceId, id, job.id, force);
+      results.push({ businessId: id, scanJobId: job.id, outcome: outcome.outcome });
+      continue;
+    }
+
     await sendJob(
       JOB_NAMES.scanBusiness,
       { workspaceId: ctx.workspaceId, businessId: id, scanJobId: job.id, force },
       { singletonKey: `scan:${job.id}`, retryLimit: 1, expireInSeconds: 10 * 60 },
     );
-    await publishEvent(ctx.workspaceId, "scan.queued", { businessId: id, scanJobId: job.id });
     results.push({ businessId: id, scanJobId: job.id });
   }
   return results;

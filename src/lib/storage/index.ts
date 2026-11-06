@@ -21,6 +21,21 @@ export function hashText(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+/**
+ * Write a database-stored upload to the writable temp directory so the CSV / ZIP
+ * parsers can stream it. The caller is responsible for removing the directory.
+ */
+export async function materializeUpload(
+  directory: string,
+  filename: string,
+  base64: string,
+): Promise<string> {
+  await fs.mkdir(directory, { recursive: true });
+  const filePath = path.join(directory, safeFilename(filename));
+  await fs.writeFile(filePath, Buffer.from(base64, "base64"));
+  return filePath;
+}
+
 export async function saveUpload(
   workspaceId: string,
   filename: string,

@@ -162,8 +162,9 @@ export function LeadsWorkspace() {
     try {
       const result = await apiFetch<{
         affected?: number;
-        results?: Array<{ scanJobId: string | null; reason?: string }>;
+        results?: Array<{ scanJobId: string | null; reason?: string; outcome?: string }>;
         workerOnline?: boolean;
+        inline?: boolean;
       }>(
         "/api/leads/bulk",
         {
@@ -174,7 +175,14 @@ export function LeadsWorkspace() {
       if (action === "scan") {
         const queued = result.results?.filter((item) => item.scanJobId).length ?? 0;
         const skipped = (result.results?.length ?? 0) - queued;
-        if (queued && result.workerOnline === false) {
+        if (result.inline) {
+          const needReview = result.results?.filter((item) => item.outcome && item.outcome !== "success").length ?? 0;
+          toast.success(
+            queued
+              ? `Scanned ${queued} website${queued === 1 ? "" : "s"}${needReview ? `, ${needReview} need review` : ""}${skipped ? `, skipped ${skipped}` : ""}.`
+              : "No scans were run. Check that these leads have websites.",
+          );
+        } else if (queued && result.workerOnline === false) {
           toast.warning(
             `Queued ${queued} website scan${queued === 1 ? "" : "s"}, but the scan worker is offline. Start it with pnpm worker.`,
           );

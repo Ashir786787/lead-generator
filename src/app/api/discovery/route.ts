@@ -16,6 +16,7 @@ import { plannerStatuses } from "@/lib/discovery/ai";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 300;
 
 const searchSchema = z.object({
   provider: z.enum(["osm", "google_places"]),

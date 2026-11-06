@@ -74,6 +74,12 @@ export async function sendJob<K extends keyof JobPayloadMap>(
   data: JobPayloadMap[K],
   options?: { singletonKey?: string; retryLimit?: number; expireInSeconds?: number },
 ): Promise<string | null> {
+  if (env.inlineJobs) {
+    // No worker process exists in inline mode; the caller runs the work
+    // directly. This guard prevents accidental pg-boss connections.
+    logger.debug({ job: name }, "Inline jobs mode: job not queued");
+    return null;
+  }
   const boss = await getBoss();
   const sendOptions: SendOptions = {
     retryLimit: options?.retryLimit ?? 2,

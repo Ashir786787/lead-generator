@@ -333,6 +333,9 @@ export const importJobs = pgTable(
     mappingHash: text("mapping_hash"),
     idempotencyKey: text("idempotency_key"),
     storagePath: text("storage_path"),
+    // Base64 copy of the uploaded file when running without a persistent disk
+    // (Vercel/serverless). Cleared once the import has finished successfully.
+    fileData: text("file_data"),
     mapping: jsonb("mapping").$type<Record<string, string>>(),
     detectedColumns: jsonb("detected_columns").$type<string[]>(),
     status: jobStatusEnum("status").notNull().default("queued"),

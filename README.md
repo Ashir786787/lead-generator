@@ -59,7 +59,7 @@ that were actually checked.
 | Data fetching | TanStack Query, TanStack Table |
 | Validation | Zod 4 |
 | Database | PostgreSQL 16+ (Drizzle ORM) |
-| Jobs | pg-boss 12, separate worker process |
+| Jobs | pg-boss 12 worker, or inline jobs on serverless |
 | Auth | Better Auth (email + password) |
 | Logging | pino |
 | Tests | Vitest + Playwright |
@@ -96,6 +96,10 @@ Website scans, imports and score recalculation are processed by the pg-boss work
 combined `dev`/`start` commands launch it for you; if you use `dev:web` or `start:web` on
 their own, start `pnpm worker` too. The app shows an "Automation worker offline" banner
 when no worker heartbeat is visible, and queued jobs resume as soon as one connects.
+
+On a serverless host there is no worker process. Set `INLINE_JOBS=true` (or deploy to
+Vercel, which sets it automatically) and jobs run inside the request that creates them.
+See [Deployment](#deployment).
 
 On first run the database has zero users. Open `http://localhost:3000/setup` to create
 the owner account. After that, self-service signup is disabled unless
@@ -146,8 +150,11 @@ All variables are documented in [`.env.example`](.env.example). The most importa
 | `BETTER_AUTH_SECRET` | dev placeholder | **Must** be replaced in production |
 | `BETTER_AUTH_URL` / `NEXT_PUBLIC_APP_URL` | `http://localhost:3000` | Auth and absolute URL base |
 | `ALLOW_SIGNUP` | `false` | Signup only when zero users, or always when true |
-| `STORAGE_DIR` | `.data/storage` | Upload storage |
-| `MAX_UPLOAD_BYTES` | 50 MiB | Upload cap |
+| `STORAGE_DIR` | `.data/storage` | Upload storage (`/tmp/storage` on Vercel) |
+| `UPLOAD_STORAGE` | `local` | `local` or `database`; defaults to `database` in inline mode |
+| `INLINE_JOBS` | `false` | Run jobs inside the request (auto-enabled on Vercel) |
+| `INLINE_JOB_BUDGET_MS` | `180000` | Inline scan budget before remaining scans are failed honestly |
+| `MAX_UPLOAD_BYTES` | 50 MiB | Upload cap (Vercel request bodies are capped at 4.5 MB) |
 | `SCAN_*` | see example | Timeouts, page count, politeness, UA |
 | `ALLOW_PRIVATE_TARGETS_FOR_TESTS` | `false` | Test-only; startup fails in production |
 | `OVERPASS_ENDPOINT` | public OSM endpoint | Backup tag search when the POI index is empty |
@@ -200,6 +207,64 @@ an honest error if both fail. Nothing is saved on failure.
 Maps use Leaflet with OpenStreetMap tiles. Geocoding and POI queries share a 1 request/second
 Nominatim throttle with caching. Positions are source coordinates, not verified addresses.
 Set `GEOCODE_USER_AGENT` to a real contact URL/email before public deployment.
+
+## Deployment
+
+### Vercel (serverless, free tier)
+
+Vercel has no long-lived worker process or durable local disk, so the app switches to
+**inline jobs** and **database uploads**:
+
+- Scans, imports and score recalculation run inside the API request that starts them.
+- Uploaded files are stored as base64 in `import_jobs.file_data` and cleared after a
+  successful import. `/tmp` is used only for working files.
+- The worker-offline banner stays hidden because the app reports inline jobs as online.
+
+Set these environment variables (Vercel sets `VERCEL=1`, which enables the first two
+automatically):
+
+```bash
+INLINE_JOBS=true
+UPLOAD_STORAGE=database
+STORAGE_DIR=/tmp/storage
+DATABASE_URL=postgresql://...        # managed Postgres, direct/session connection
+BETTER_AUTH_SECRET=...               # openssl rand -base64 32
+BETTER_AUTH_URL=https://your-app.vercel.app
+NEXT_PUBLIC_APP_URL=https://your-app.vercel.app
+```
+
+Also set `SCAN_USER_AGENT` and `GEOCODE_USER_AGENT` to a real contact URL/email, plus any
+AI keys you use. Do **not** set `ALLOW_PRIVATE_TARGETS_FOR_TESTS=true` or
+`NODE_ENV=development` in production.
+
+Run migrations against the production database once before the first deploy:
+
+```bash
+DATABASE_URL="postgresql://...?sslmode=require" pnpm db:migrate
+```
+
+Then deploy from `main`, open `https://your-app.vercel.app/setup`, and create the owner
+account. `NEXT_PUBLIC_APP_URL` and `NEXT_PUBLIC_APP_NAME` are baked into the build, so
+redeploy after changing them.
+
+Vercel-specific limits (the UI reports them honestly):
+
+- Function duration is capped at 300 seconds. Inline scans stop starting new work after
+  `INLINE_JOB_BUDGET_MS` (default 180 s) and mark the remainder failed with an explanation.
+  Large imports can still exceed the cap; split them into smaller files.
+- Request bodies are capped at 4.5 MB on Hobby, so uploads must be smaller than that even
+  though `MAX_UPLOAD_BYTES` allows more locally.
+- Live events use `LISTEN/NOTIFY`; a serverless stream can be cut at the function limit.
+  The UI also polls, so job progress still appears.
+- Use a direct or session-mode Postgres URL (not Neon's transaction pooler) so
+  `LISTEN/NOTIFY` and migrations work.
+
+### Long-running host (Railway, Render, Fly.io, VPS)
+
+Use one service that runs the web app and worker together (`pnpm start`), a persistent
+volume (for example `/data` mounted with `STORAGE_DIR=/data/storage`), and managed
+PostgreSQL. Keep `INLINE_JOBS=false` and `UPLOAD_STORAGE=local`. This mode removes the
+serverless limits above and is the better choice for large imports or bulk scans.
 
 ## Data safety
 

@@ -3,7 +3,7 @@ import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { importJobs, workspaces } from "@/lib/db/schema";
-import { storageRoot, resolveStoredPath } from "@/lib/storage";
+import { storageRoot, materializeUpload, resolveStoredPath } from "@/lib/storage";
 import { iterateFile, countRowsHint } from "./parse";
 import { finalizeImportJob, ingestRecords, type IngestCounts } from "./ingest";
 import { publishEvent } from "@/lib/events/bus";
@@ -18,13 +18,21 @@ export interface ImportProcessResult {
 
 export async function processImport(workspaceId: string, importJobId: string): Promise<ImportProcessResult> {
   const [job] = await db
-    .select()
+    .select({
+      status: importJobs.status,
+      storagePath: importJobs.storagePath,
+      fileData: importJobs.fileData,
+      rowCount: importJobs.rowCount,
+      createdBy: importJobs.createdBy,
+      filename: importJobs.filename,
+      mapping: importJobs.mapping,
+    })
     .from(importJobs)
     .where(and(eq(importJobs.workspaceId, workspaceId), eq(importJobs.id, importJobId)))
     .limit(1);
   if (!job) return { status: "failed", error: "Import job not found." };
   if (job.status === "completed" || job.status === "cancelled") return { status: "skipped" };
-  if (!job.storagePath) {
+  if (!job.storagePath && !job.fileData) {
     await failImport(workspaceId, importJobId, "The uploaded file is missing from storage.");
     return { status: "failed", error: "The uploaded file is missing from storage." };
   }
@@ -46,10 +54,14 @@ export async function processImport(workspaceId: string, importJobId: string): P
     .where(and(eq(importJobs.workspaceId, workspaceId), eq(importJobs.id, importJobId)));
 
   try {
-    const filePath = resolveStoredPath(job.storagePath);
-    const totalHint = job.rowCount > 0 ? job.rowCount : (await countRowsHint(filePath)) ?? undefined;
     await fs.rm(workDir, { recursive: true, force: true });
     await fs.mkdir(workDir, { recursive: true });
+    // Local mode reads the persisted upload; serverless mode writes the
+    // database copy into the only writable directory (/tmp) for streaming.
+    const filePath = job.storagePath
+      ? resolveStoredPath(job.storagePath)
+      : await materializeUpload(workDir, job.filename, job.fileData ?? "");
+    const totalHint = job.rowCount > 0 ? job.rowCount : (await countRowsHint(filePath)) ?? undefined;
 
     const actor = { workspaceId, userId: job.createdBy, isDemo: workspace.isDemo };
     const mapping = (job.mapping ?? {}) as ColumnMapping;
@@ -103,6 +115,13 @@ export async function processImport(workspaceId: string, importJobId: string): P
     }
 
     await finalizeImportJob(actor, importJobId, counts);
+    if (job.fileData) {
+      // The import is complete; drop the base64 copy to keep the database small.
+      await db
+        .update(importJobs)
+        .set({ fileData: null })
+        .where(and(eq(importJobs.workspaceId, workspaceId), eq(importJobs.id, importJobId)));
+    }
     return { status: "completed", counts };
   } catch (error) {
     const message = error instanceof Error ? error.message : "The import could not be completed.";

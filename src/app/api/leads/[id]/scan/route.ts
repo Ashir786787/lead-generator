@@ -5,9 +5,11 @@ import { getWorkspaceContext } from "@/lib/auth/session";
 import { listScanJobs, queueScans } from "@/lib/scan/service";
 import { getWorkerHealth, isScanWorkerOnline } from "@/lib/jobs/health";
 import { checkRateLimit } from "@/lib/api/rate-limit";
+import { env } from "@/lib/env";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 300;
 
 const bodySchema = z.object({ force: z.boolean().optional() });
 
@@ -28,6 +30,6 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const body = bodySchema.parse(raw);
     const results = await queueScans(ctx, [id], Boolean(body.force));
     const workerOnline = isScanWorkerOnline(await getWorkerHealth());
-    return NextResponse.json({ results, workerOnline }, { status: 202 });
+    return NextResponse.json({ results, workerOnline, inline: env.inlineJobs }, { status: 202 });
   });
 }

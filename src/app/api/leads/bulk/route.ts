@@ -7,9 +7,11 @@ import { queueScans } from "@/lib/scan/service";
 import { getWorkerHealth, isScanWorkerOnline } from "@/lib/jobs/health";
 import { PIPELINE_STATUSES } from "@/lib/constants";
 import { checkRateLimit } from "@/lib/api/rate-limit";
+import { env } from "@/lib/env";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 300;
 
 const schema = z.discriminatedUnion("action", [
   z.object({
@@ -49,6 +51,6 @@ export async function POST(request: Request) {
     }
     const results = await queueScans(ctx, body.ids, Boolean(body.force));
     const workerOnline = isScanWorkerOnline(await getWorkerHealth());
-    return NextResponse.json({ results, workerOnline }, { status: 202 });
+    return NextResponse.json({ results, workerOnline, inline: env.inlineJobs }, { status: 202 });
   });
 }

@@ -3,13 +3,16 @@
 These are deliberate boundaries or environment constraints, not hidden defects. Where a
 limitation affects a user decision, the UI is expected to say so honestly.
 
-**The jobs worker must be running.** Website scans, imports and score recalculation are
-queued through pg-boss and only progress while a worker is connected. `pnpm dev` and
-`pnpm start` launch the web app and worker together; if you use `pnpm dev:web` or
-`pnpm start:web`, also run `pnpm worker`. When no worker heartbeat is visible the app
-shows an "Automation worker offline" banner and jobs remain queued rather than failing
-silently. pg-boss writes a heartbeat roughly every 30 seconds, so the banner can appear
-briefly right after a restart before the first heartbeat lands.
+**The jobs worker must be running — unless inline mode is enabled.** By default website
+scans, imports and score recalculation are queued through pg-boss and only progress while
+a worker is connected. `pnpm dev` and `pnpm start` launch the web app and worker together;
+if you use `pnpm dev:web` or `pnpm start:web`, also run `pnpm worker`. When no worker
+heartbeat is visible the app shows an "Automation worker offline" banner and jobs remain
+queued rather than failing silently. pg-boss writes a heartbeat roughly every 30 seconds,
+so the banner can appear briefly right after a restart before the first heartbeat lands.
+With `INLINE_JOBS=true` (automatic on Vercel) there is no worker: jobs run inside the API
+request and the banner is hidden. The platform's function-duration cap then applies; see
+[Deployment](../README.md#deployment).
 
 ## Scanning
 
@@ -68,12 +71,17 @@ briefly right after a restart before the first heartbeat lands.
 19. **Category list is fixed.** The profile has 18 categories plus "other". A custom
     taxonomy is not exposed in the UI.
 20. **Profile changes are workspace-wide.** Recalculation can be expensive for very large
-    lists; it runs as a job, not inline.
+    lists. It runs as a worker job, or inline in serverless mode where a very large list
+    can hit the function duration limit before finishing.
 
 ## Operations
 
-21. **Local disk storage.** Uploads live in `STORAGE_DIR`. There is no S3 adapter; a
-    multi-instance deployment needs shared storage.
+21. **Upload storage depends on the host.** Local and long-running deployments keep files
+    in `STORAGE_DIR` (a persistent volume is required for multiple instances). Serverless
+    mode stores a base64 copy in `import_jobs.file_data`, which is removed after a
+    successful import; `/tmp` is only a working directory. Uploads are therefore bounded
+    by the platform request-body limit (4.5 MB on Vercel Hobby), and there is no S3/R2
+    adapter.
 22. **Synchronous CSV export.** The export is generated in the request and held in memory.
     Very large exports can hit time/memory limits; `export.generate` is reserved but not
     used yet.
@@ -83,9 +91,12 @@ briefly right after a restart before the first heartbeat lands.
     retention are deployment responsibilities.
 25. **Single region / no HA.** No replication, failover or queue sharding is configured.
 26. **Live events use PostgreSQL `LISTEN/NOTIFY`.** Payloads over ~8 KB are truncated by
-    design; clients refetch data after the signal. This is not a durable event log.
-27. **One worker type.** Worker concurrency and scan concurrency are global settings; there
-    is no per-workspace resource isolation.
+    design; clients refetch data after the signal. This is not a durable event log. On
+    serverless hosts the stream can be closed at the function duration limit; the UI also
+    polls, so progress still appears.
+27. **Worker concurrency applies to long-running hosts.** Worker and scan concurrency are
+    global settings; there is no per-workspace isolation. Inline mode processes one job at
+    a time per request and stops starting new scans after `INLINE_JOB_BUDGET_MS`.
 
 ## UI and testing
 
