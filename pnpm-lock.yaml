@@ -113,6 +113,9 @@ importers:
       tailwind-merge:
         specifier: 3.7.0
         version: 3.7.0
+      tsx:
+        specifier: 4.23.15
+        version: 4.23.15
       undici:
         specifier: 8.12.3
         version: 8.12.3
@@ -174,9 +177,6 @@ importers:
       tailwindcss:
         specifier: 4.3.4
         version: 4.3.4
-      tsx:
-        specifier: 4.23.15
-        version: 4.23.15
       typescript:
         specifier: 5.9.3
         version: 5.9.3
