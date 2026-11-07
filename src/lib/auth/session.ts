@@ -1,3 +1,4 @@
+import { cache } from "react";
 import { cookies, headers } from "next/headers";
 import { collections } from "@/lib/db";
 import type { MembershipDoc, WorkspaceDoc } from "@/lib/db/types";
@@ -55,11 +56,11 @@ async function workspaceRowsForUser(userId: string): Promise<WorkspaceRow[]> {
   );
 }
 
-export async function getSessionUser(): Promise<SessionUser | null> {
+export const getSessionUser = cache(async (): Promise<SessionUser | null> => {
   const session = await auth.api.getSession({ headers: await headers() });
   if (!session?.user) return null;
   return { id: session.user.id, email: session.user.email, name: session.user.name };
-}
+});
 
 export async function listWorkspacesForUser(userId: string): Promise<WorkspaceSummary[]> {
   const rows = await workspaceRowsForUser(userId);
@@ -76,7 +77,7 @@ export async function listWorkspacesForUser(userId: string): Promise<WorkspaceSu
  * The only way route handlers / pages obtain a workspace. Every data-access
  * function requires the returned workspaceId, so an unscoped query is a type error.
  */
-export async function getWorkspaceContext(): Promise<WorkspaceContext> {
+export const getWorkspaceContext = cache(async (): Promise<WorkspaceContext> => {
   const sessionUser = await getSessionUser();
   if (!sessionUser) throw unauthorized();
 
@@ -107,7 +108,7 @@ export async function getWorkspaceContext(): Promise<WorkspaceContext> {
       role: row.role,
     })),
   };
-}
+});
 
 export async function assertWorkspaceMembership(userId: string, workspaceId: string): Promise<void> {
   const row = await collections.memberships.findOne({ userId, workspaceId });

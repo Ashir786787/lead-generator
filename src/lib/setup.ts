@@ -1,3 +1,4 @@
+import { cache } from "react";
 import { collections } from "@/lib/db";
 
 export interface SetupStatus {
@@ -6,14 +7,14 @@ export interface SetupStatus {
   appName: string;
 }
 
-export async function getSetupStatus(): Promise<SetupStatus> {
+export const getSetupStatus = cache(async (): Promise<SetupStatus> => {
   const userCount = await collections.user.countDocuments();
   return {
     needsSetup: userCount === 0,
     userCount,
     appName: process.env.NEXT_PUBLIC_APP_NAME ?? "Lead Finder",
   };
-}
+});
 
 export async function ownerHint(): Promise<string> {
   return process.env.OWNER_EMAIL ?? "";

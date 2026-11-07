@@ -55,9 +55,10 @@ export const mongoClient =
     retryWrites: true,
   });
 
-if (!env.isProduction) {
-  globalForMongo.__leadFinderMongoClient = mongoClient;
-}
+// Cache the client on globalThis in every environment: serverless instances are
+// re-used across invocations, and without this each cold start opens a brand-new
+// connection pool against Atlas.
+globalForMongo.__leadFinderMongoClient = mongoClient;
 
 export const mongoDb: Db = mongoClient.db(env.mongoDbName);
 
