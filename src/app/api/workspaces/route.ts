@@ -16,7 +16,12 @@ export const dynamic = "force-dynamic";
 
 const postSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("switch"), workspaceId: z.string().uuid() }),
-  z.object({ action: z.literal("add_member"), email: z.string().trim().email().max(320) }),
+  z.object({
+    action: z.literal("add_member"),
+    email: z.string().trim().email().max(320),
+    password: z.string().min(8, "Use at least 8 characters.").max(128),
+    name: z.string().trim().max(120).optional(),
+  }),
 ]);
 
 const patchSchema = z.object({
@@ -63,7 +68,11 @@ export async function POST(request: Request) {
       });
       return NextResponse.json({ ok: true, workspaceId: body.workspaceId });
     }
-    const member = await addWorkspaceMember(ctx, body.email);
+    const member = await addWorkspaceMember(ctx, {
+      email: body.email,
+      password: body.password,
+      name: body.name,
+    });
     return NextResponse.json({ member }, { status: 201 });
   });
 }

@@ -67,7 +67,9 @@ export function SettingsView({
   const [settings, setSettings] = React.useState(initial);
   const [name, setName] = React.useState(initial.name);
   const [tz, setTz] = React.useState(initial.timezone);
-  const [email, setEmail] = React.useState("");
+  const [memberName, setMemberName] = React.useState("");
+  const [memberEmail, setMemberEmail] = React.useState("");
+  const [memberPassword, setMemberPassword] = React.useState("");
   const [currentPassword, setCurrentPassword] = React.useState("");
   const [newPassword, setNewPassword] = React.useState("");
   const [confirmPassword, setConfirmPassword] = React.useState("");
@@ -124,15 +126,30 @@ export function SettingsView({
   }
 
   async function addMember() {
-    if (!email.trim()) return;
+    const email = memberEmail.trim();
+    if (!email || memberPassword.length < 8) return;
     setAdding(true);
     try {
-      await apiFetch("/api/workspaces", {
-        method: "POST",
-        body: JSON.stringify({ action: "add_member", email: email.trim() }),
-      });
-      toast.success("Member added.");
-      setEmail("");
+      const result = await apiFetch<{ member: { created: boolean; passwordUpdated: boolean } }>(
+        "/api/workspaces",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            action: "add_member",
+            email,
+            password: memberPassword,
+            name: memberName.trim() || undefined,
+          }),
+        },
+      );
+      toast.success(
+        result.member.created
+          ? `Account created and added for ${email}.`
+          : `Password set and ${email} added to the workspace.`,
+      );
+      setMemberEmail("");
+      setMemberPassword("");
+      setMemberName("");
       router.refresh();
     } catch (error) {
       toast.error(errorMessage(error));
@@ -289,21 +306,48 @@ export function SettingsView({
             {isOwner ? (
               <div className="mt-4 border-t border-border/70 pt-4">
                 <Field
-                  label="Add an existing account"
+                  label="Add a member"
                   htmlFor="member-email"
-                  hint="The person must already have an account in this app."
+                  hint="Creates the account if it does not exist, sets the password you choose (stored hashed) and adds the person as a member. If the account already exists, the password is reset to what you type. They can change it later in Settings → Security."
                 >
-                  <div className="flex gap-2">
+                  <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_minmax(0,1.2fr)]">
+                    <Input
+                      id="member-name"
+                      aria-label="Name (optional)"
+                      value={memberName}
+                      onChange={(event) => setMemberName(event.target.value)}
+                      placeholder="Name (optional)"
+                      maxLength={120}
+                    />
                     <Input
                       id="member-email"
                       type="email"
-                      value={email}
-                      onChange={(event) => setEmail(event.target.value)}
-                      placeholder="teammate@example.com"
+                      value={memberEmail}
+                      onChange={(event) => setMemberEmail(event.target.value)}
+                      placeholder="person@example.com"
+                      maxLength={320}
                     />
-                    <Button type="button" onClick={() => void addMember()} disabled={!email.trim() || adding} className="shrink-0">
-                      {adding ? <Loader2 className="animate-spin" /> : <UserPlus />} Add
+                    <Input
+                      id="member-password"
+                      type="password"
+                      autoComplete="new-password"
+                      value={memberPassword}
+                      onChange={(event) => setMemberPassword(event.target.value)}
+                      placeholder="Password (min 8 characters)"
+                    />
+                  </div>
+                  <div className="mt-3 flex items-center gap-3">
+                    <Button
+                      type="button"
+                      onClick={() => void addMember()}
+                      disabled={!memberEmail.trim() || memberPassword.length < 8 || adding}
+                      className="shrink-0"
+                    >
+                      {adding ? <Loader2 className="animate-spin" /> : <UserPlus />} Create & add
                     </Button>
+                    {memberEmail.trim() && memberPassword.length > 0 && memberPassword.length < 8 ? (
+                      <span className="text-xs text-muted-foreground">Password needs at least 8 characters.</span>
+                    ) : null}
                   </div>
                 </Field>
               </div>

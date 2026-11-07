@@ -1,5 +1,6 @@
-import { collections, newId, now } from "@/lib/db";
-import type { WorkspaceDoc } from "@/lib/db/types";
+import { hashPassword } from "better-auth/crypto";
+import { collections, newId, now, withTransaction } from "@/lib/db";
+import type { AccountDoc, UserDoc, WorkspaceDoc } from "@/lib/db/types";
 import type { WorkspaceContext } from "@/lib/auth/session";
 import { assertWorkspaceMembership } from "@/lib/auth/session";
 import { conflict, forbidden, notFound } from "@/lib/api/errors";
@@ -83,32 +84,133 @@ export async function updateWorkspaceSettings(
   await collections.workspaces.updateOne({ _id: ctx.workspaceId }, { $set: updates });
 }
 
+export interface AddedWorkspaceMember {
+  id: string;
+  name: string;
+  email: string;
+  /** True when the account did not exist and was created for this workspace. */
+  created: boolean;
+  /** True when an existing account's password was updated. */
+  passwordUpdated: boolean;
+}
+
+/**
+ * Adds someone to the workspace, creating their account when needed and setting
+ * the password the owner types in. Setting a password for an existing account is
+ * treated as a deliberate reset: the credential password is updated and every
+ * existing session for that account is revoked. Owner accounts cannot be created
+ * here — new accounts always join as members.
+ */
 export async function addWorkspaceMember(
   ctx: WorkspaceContext,
-  email: string,
-): Promise<{ id: string; name: string; email: string }> {
+  input: { email: string; password: string; name?: string },
+): Promise<AddedWorkspaceMember> {
   if (ctx.role !== "owner") throw forbidden("Only a workspace owner can add members.");
-  const normalized = email.trim().toLowerCase();
-  const target = await collections.user.findOne(
-    { email: normalized },
-    { projection: { _id: 1, name: 1, email: 1 } },
-  );
-  if (!target) {
-    throw conflict("No account uses that email yet. Ask them to create an account first.");
-  }
-  const existing = await collections.memberships.findOne({
-    workspaceId: ctx.workspaceId,
-    userId: target._id,
+
+  const email = input.email.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw conflict("Enter a valid email address.");
+  const password = input.password ?? "";
+  if (password.length < 8) throw conflict("Use at least 8 characters for the password.");
+  if (password.length > 128) throw conflict("That password is too long (maximum 128 characters).");
+
+  const timestamp = now();
+  const passwordHash = await hashPassword(password);
+  const name = (input.name ?? "").trim().slice(0, 120) || email.split("@")[0]!.slice(0, 80);
+
+  return withTransaction(async (session) => {
+    let user = await collections.user.findOne({ email }, { session });
+    let created = false;
+
+    if (!user) {
+      const userId = newId();
+      const newUser: UserDoc = {
+        _id: userId,
+        name,
+        email,
+        emailVerified: true,
+        image: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      await collections.user.insertOne(newUser, { session });
+      const account: AccountDoc = {
+        _id: newId(),
+        accountId: userId,
+        providerId: "credential",
+        userId,
+        accessToken: null,
+        refreshToken: null,
+        idToken: null,
+        accessTokenExpiresAt: null,
+        refreshTokenExpiresAt: null,
+        scope: null,
+        password: passwordHash,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      await collections.account.insertOne(account, { session });
+      user = newUser;
+      created = true;
+    } else {
+      const credential = await collections.account.findOne(
+        { userId: user._id, providerId: "credential" },
+        { session },
+      );
+      if (credential) {
+        await collections.account.updateOne(
+          { _id: credential._id },
+          { $set: { password: passwordHash, updatedAt: timestamp } },
+          { session },
+        );
+      } else {
+        await collections.account.insertOne(
+          {
+            _id: newId(),
+            accountId: user._id,
+            providerId: "credential",
+            userId: user._id,
+            accessToken: null,
+            refreshToken: null,
+            idToken: null,
+            accessTokenExpiresAt: null,
+            refreshTokenExpiresAt: null,
+            scope: null,
+            password: passwordHash,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          },
+          { session },
+        );
+      }
+      // Revoke the old password everywhere it was used.
+      await collections.session.deleteMany({ userId: user._id }, { session });
+    }
+
+    const existing = await collections.memberships.findOne(
+      { workspaceId: ctx.workspaceId, userId: user._id },
+      { session },
+    );
+    if (!existing) {
+      await collections.memberships.insertOne(
+        {
+          _id: newId(),
+          workspaceId: ctx.workspaceId,
+          userId: user._id,
+          role: "member",
+          createdAt: timestamp,
+        },
+        { session },
+      );
+    }
+
+    return {
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      created,
+      passwordUpdated: !created,
+    };
   });
-  if (existing) throw conflict("That person is already a member of this workspace.");
-  await collections.memberships.insertOne({
-    _id: newId(),
-    workspaceId: ctx.workspaceId,
-    userId: target._id,
-    role: "member",
-    createdAt: now(),
-  });
-  return { id: target._id, name: target.name, email: target.email };
 }
 
 export async function switchWorkspace(ctx: WorkspaceContext, workspaceId: string): Promise<void> {
