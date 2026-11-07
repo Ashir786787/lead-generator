@@ -290,6 +290,79 @@ export async function addWorkspaceMember(
   });
 }
 
+/** Count of owners in the workspace. Used to refuse orphaning a workspace. */
+async function countOwners(workspaceId: string): Promise<number> {
+  return collections.memberships.countDocuments({ workspaceId, role: "owner" });
+}
+
+export async function updateMemberRole(
+  ctx: WorkspaceContext,
+  memberUserId: string,
+  role: "owner" | "member",
+): Promise<{ id: string; role: "owner" | "member" }> {
+  if (ctx.role !== "owner") throw forbidden("Only a workspace owner can change member roles.");
+  if (role !== "owner" && role !== "member") throw conflict("Choose a valid role.");
+
+  const target = await collections.memberships.findOne({
+    workspaceId: ctx.workspaceId,
+    userId: memberUserId,
+  });
+  if (!target) throw notFound("That person is not a member of this workspace.");
+  if (target.role === role) return { id: target.userId, role };
+
+  if (target.role === "owner" && (await countOwners(ctx.workspaceId)) <= 1) {
+    throw conflict("A workspace must keep at least one owner.");
+  }
+
+  await collections.memberships.updateOne(
+    { workspaceId: ctx.workspaceId, userId: memberUserId },
+    { $set: { role } },
+  );
+  await collections.activities.insertOne({
+    _id: newId(),
+    workspaceId: ctx.workspaceId,
+    businessId: null,
+    type: "owner_changed",
+    message: `Member role changed to ${role}.`,
+    metadata: { targetUserId: memberUserId, role },
+    actorId: ctx.user.id,
+    createdAt: now(),
+  });
+  return { id: target.userId, role };
+}
+
+export async function removeWorkspaceMember(
+  ctx: WorkspaceContext,
+  memberUserId: string,
+): Promise<void> {
+  if (ctx.role !== "owner") throw forbidden("Only a workspace owner can remove members.");
+
+  const target = await collections.memberships.findOne({
+    workspaceId: ctx.workspaceId,
+    userId: memberUserId,
+  });
+  if (!target) throw notFound("That person is not a member of this workspace.");
+
+  if (target.role === "owner" && (await countOwners(ctx.workspaceId)) <= 1) {
+    throw conflict("A workspace must keep at least one owner. Add another owner before removing this one.");
+  }
+
+  await collections.memberships.deleteOne({
+    workspaceId: ctx.workspaceId,
+    userId: memberUserId,
+  });
+  await collections.activities.insertOne({
+    _id: newId(),
+    workspaceId: ctx.workspaceId,
+    businessId: null,
+    type: "owner_changed",
+    message: "Member removed from the workspace.",
+    metadata: { targetUserId: memberUserId, previousRole: target.role },
+    actorId: ctx.user.id,
+    createdAt: now(),
+  });
+}
+
 export async function switchWorkspace(ctx: WorkspaceContext, workspaceId: string): Promise<void> {
   await assertWorkspaceMembership(ctx.user.id, workspaceId);
 }

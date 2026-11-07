@@ -6,7 +6,9 @@ import { getWorkspaceContext } from "@/lib/auth/session";
 import {
   addWorkspaceMember,
   getWorkspaceSettings,
+  removeWorkspaceMember,
   switchWorkspace,
+  updateMemberRole,
   updateWorkspaceSettings,
 } from "@/lib/data/workspace";
 import { WORKSPACE_COOKIE } from "@/lib/constants";
@@ -22,6 +24,15 @@ const postSchema = z.discriminatedUnion("action", [
     password: z.string().min(8, "Use at least 8 characters.").max(128),
     name: z.string().trim().max(120).optional(),
     destination: z.enum(["shared", "personal"]).default("shared"),
+  }),
+  z.object({
+    action: z.literal("set_member_role"),
+    userId: z.string().uuid(),
+    role: z.enum(["owner", "member"]),
+  }),
+  z.object({
+    action: z.literal("remove_member"),
+    userId: z.string().uuid(),
   }),
 ]);
 
@@ -68,6 +79,14 @@ export async function POST(request: Request) {
         maxAge: 60 * 60 * 24 * 365,
       });
       return NextResponse.json({ ok: true, workspaceId: body.workspaceId });
+    }
+    if (body.action === "set_member_role") {
+      const member = await updateMemberRole(ctx, body.userId, body.role);
+      return NextResponse.json({ member });
+    }
+    if (body.action === "remove_member") {
+      await removeWorkspaceMember(ctx, body.userId);
+      return NextResponse.json({ ok: true });
     }
     const member = await addWorkspaceMember(ctx, {
       email: body.email,

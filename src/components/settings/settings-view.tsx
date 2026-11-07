@@ -13,6 +13,7 @@ import {
   Save,
   ShieldCheck,
   SlidersHorizontal,
+  Trash2,
   UserPlus,
   Users,
 } from "lucide-react";
@@ -58,10 +59,12 @@ export function SettingsView({
   initial,
   role,
   timezone,
+  currentUserId,
 }: {
   initial: WorkspaceSettings;
   role: "owner" | "member";
   timezone: string;
+  currentUserId: string;
 }) {
   const router = useRouter();
   const [settings, setSettings] = React.useState(initial);
@@ -71,6 +74,7 @@ export function SettingsView({
   const [memberEmail, setMemberEmail] = React.useState("");
   const [memberPassword, setMemberPassword] = React.useState("");
   const [memberDestination, setMemberDestination] = React.useState<"shared" | "personal">("shared");
+  const [memberActionId, setMemberActionId] = React.useState<string | null>(null);
   const [currentPassword, setCurrentPassword] = React.useState("");
   const [newPassword, setNewPassword] = React.useState("");
   const [confirmPassword, setConfirmPassword] = React.useState("");
@@ -95,6 +99,42 @@ export function SettingsView({
       toast.error(errorMessage(error));
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function setMemberRole(userId: string, memberRole: "owner" | "member") {
+    setMemberActionId(userId);
+    try {
+      await apiFetch("/api/workspaces", {
+        method: "POST",
+        body: JSON.stringify({ action: "set_member_role", userId, role: memberRole }),
+      });
+      toast.success(memberRole === "owner" ? "Promoted to owner." : "Changed to member.");
+      router.refresh();
+    } catch (error) {
+      toast.error(errorMessage(error));
+    } finally {
+      setMemberActionId(null);
+    }
+  }
+
+  async function removeMember(member: { id: string; name: string; email: string }) {
+    const confirmed = window.confirm(
+      `Remove ${member.name} (${member.email}) from this workspace?\n\nThey keep their account and any other workspaces. You can add them again later.`,
+    );
+    if (!confirmed) return;
+    setMemberActionId(member.id);
+    try {
+      await apiFetch("/api/workspaces", {
+        method: "POST",
+        body: JSON.stringify({ action: "remove_member", userId: member.id }),
+      });
+      toast.success(`${member.name} removed from this workspace.`);
+      router.refresh();
+    } catch (error) {
+      toast.error(errorMessage(error));
+    } finally {
+      setMemberActionId(null);
     }
   }
 
@@ -296,7 +336,12 @@ export function SettingsView({
                     {member.name.slice(0, 1).toUpperCase()}
                   </span>
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium">{member.name}</p>
+                    <p className="truncate text-sm font-medium">
+                      {member.name}
+                      {member.id === currentUserId ? (
+                        <span className="ml-1.5 text-xs font-normal text-muted-foreground">(you)</span>
+                      ) : null}
+                    </p>
                     <p className="truncate text-xs text-muted-foreground">{member.email}</p>
                   </div>
                   <Badge variant={member.role === "owner" ? "default" : "outline"} className="capitalize">
@@ -305,6 +350,36 @@ export function SettingsView({
                   <span className="w-full text-xs text-muted-foreground sm:w-auto">
                     joined {formatDate(member.joinedAt, timezone)}
                   </span>
+                  {isOwner ? (
+                    <div className="flex w-full items-center gap-2 sm:w-auto">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={memberActionId !== null}
+                        onClick={() =>
+                          void setMemberRole(member.id, member.role === "owner" ? "member" : "owner")
+                        }
+                      >
+                        {memberActionId === member.id ? (
+                          <Loader2 className="animate-spin" />
+                        ) : null}
+                        {member.role === "owner" ? "Make member" : "Make owner"}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="iconSm"
+                        className="text-destructive hover:bg-destructive/10"
+                        aria-label={`Remove ${member.name} from this workspace`}
+                        title="Remove from workspace"
+                        disabled={memberActionId !== null}
+                        onClick={() => void removeMember(member)}
+                      >
+                        <Trash2 />
+                      </Button>
+                    </div>
+                  ) : null}
                 </li>
               ))}
             </ul>

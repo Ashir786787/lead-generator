@@ -7,5 +7,5 @@ export const dynamic = "force-dynamic";
 export default async function SettingsPage() {
   const ctx = await getWorkspaceContext();
   const settings = await getWorkspaceSettings(ctx);
-  return <SettingsView initial={settings} role={ctx.role} timezone={ctx.timezone} />;
+  return <SettingsView initial={settings} role={ctx.role} timezone={ctx.timezone} currentUserId={ctx.user.id} />;
 }
