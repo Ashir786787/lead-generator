@@ -3,9 +3,7 @@ import { z } from "zod";
 import { apiRoute } from "@/lib/api/route";
 import { getWorkspaceContext } from "@/lib/auth/session";
 import { listScanJobs, queueScans } from "@/lib/scan/service";
-import { getWorkerHealth, isScanWorkerOnline } from "@/lib/jobs/health";
 import { checkRateLimit } from "@/lib/api/rate-limit";
-import { env } from "@/lib/env";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -29,7 +27,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const raw = await request.json().catch(() => ({}));
     const body = bodySchema.parse(raw);
     const results = await queueScans(ctx, [id], Boolean(body.force));
-    const workerOnline = isScanWorkerOnline(await getWorkerHealth());
-    return NextResponse.json({ results, workerOnline, inline: env.inlineJobs }, { status: 202 });
+    // Scans run inside this request, so the UI never has to wait for a worker.
+    return NextResponse.json({ results, workerOnline: true, inline: true }, { status: 202 });
   });
 }

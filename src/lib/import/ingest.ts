@@ -1,17 +1,12 @@
-import { and, eq } from "drizzle-orm";
-import { db } from "@/lib/db";
-import {
-  activities,
-  businesses,
-  businessLocations,
-  contactPoints,
-  evidenceRecords,
-  importJobs,
-  importRowErrors,
-  scoreResults,
-  sourceRecords,
-} from "@/lib/db/schema";
-import { normalizeBusiness, type RawBusiness } from "@/lib/normalize";
+import { collections, newId, now } from "@/lib/db";
+import type {
+  BusinessDoc,
+  ContactPointDoc,
+  EvidenceRecordDoc,
+  ScoreResultDoc,
+  SourceRecordDoc,
+} from "@/lib/db/types";
+import { normalizeBusiness, nameTokens, type RawBusiness } from "@/lib/normalize";
 import { findBestMatch, mergeBusinesses, recordDuplicateCandidate } from "@/lib/dedupe/service";
 import { computeScore } from "@/lib/score/engine";
 import { getActiveProfile, recalculateLeadScore } from "@/lib/score/service";
@@ -100,48 +95,61 @@ function payloadFor(raw: Record<string, unknown>): Record<string, unknown> | nul
   }
 }
 
-function asRecord(value: RawBusiness): Record<string, unknown> {
-  return { ...value };
-}
-
 async function createLead(
   options: IngestOptions,
   rawRecord: RawBusiness,
   normalized: ReturnType<typeof normalizeBusiness>,
   sourceId: string,
   fallbackUrl: string,
-  profile: { id: string; version: number; config: ScoreConfig },
+  profile: { _id: string; version: number; config: ScoreConfig },
 ): Promise<string> {
   const { actor } = options;
-  const [inserted] = await db
-    .insert(businesses)
-    .values({
-      workspaceId: actor.workspaceId,
-      name: normalized.name,
-      normalizedName: normalized.normalizedName,
-      category: normalized.category,
-      categoryKey: normalized.categoryKey,
-      phone: rawRecord.phone ?? null,
-      phoneE164: normalized.phone?.e164 ?? null,
-      email: normalized.emailDisplay,
-      emailNormalized: normalized.email,
-      websiteUrl: normalized.website?.url ?? null,
-      websiteHost: normalized.website?.host ?? null,
-      street: normalized.street,
-      area: normalized.area,
-      city: normalized.city,
-      country: normalized.country,
-      lat: normalized.lat,
-      lng: normalized.lng,
-      isDemo: actor.isDemo,
-      ownerId: actor.userId,
-    })
-    .returning({ id: businesses.id });
-  if (!inserted) throw new Error("Could not create the business row.");
+  const timestamp = now();
+  const businessId = newId();
 
-  const businessId = inserted.id;
+  const business: BusinessDoc = {
+    _id: businessId,
+    workspaceId: actor.workspaceId,
+    name: normalized.name,
+    normalizedName: normalized.normalizedName,
+    nameTokens: nameTokens(normalized.normalizedName),
+    category: normalized.category,
+    categoryKey: normalized.categoryKey,
+    phone: rawRecord.phone ?? null,
+    phoneE164: normalized.phone?.e164 ?? null,
+    email: normalized.emailDisplay,
+    emailNormalized: normalized.email,
+    websiteUrl: normalized.website?.url ?? null,
+    websiteHost: normalized.website?.host ?? null,
+    street: normalized.street,
+    area: normalized.area,
+    city: normalized.city,
+    country: normalized.country,
+    lat: normalized.lat,
+    lng: normalized.lng,
+    status: "new",
+    ownerId: actor.userId,
+    doNotContact: false,
+    followUpAt: null,
+    notes: null,
+    fieldLocks: [],
+    latestScore: null,
+    latestScoreResultId: null,
+    latestScanId: null,
+    latestScanOutcome: null,
+    latestChatbotResult: null,
+    lastCheckedAt: null,
+    isDemo: actor.isDemo,
+    hasWhatsapp: false,
+    mergedIntoId: null,
+    archivedAt: null,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  await collections.businesses.insertOne(business);
 
-  await db.insert(businessLocations).values({
+  await collections.businessLocations.insertOne({
+    _id: newId(),
     workspaceId: actor.workspaceId,
     businessId,
     street: normalized.street,
@@ -150,15 +158,18 @@ async function createLead(
     country: normalized.country,
     lat: normalized.lat,
     lng: normalized.lng,
+    formattedAddress: null,
     isPrimary: true,
+    createdAt: timestamp,
   });
 
-  await db.insert(sourceRecords).values({
+  const source: SourceRecordDoc = {
+    _id: newId(),
     workspaceId: actor.workspaceId,
     businessId,
     source: options.source,
     sourceId,
-    payload: payloadFor(asRecord(rawRecord)),
+    payload: payloadFor({ ...rawRecord }),
     attribution:
       options.source === "osm"
         ? "© OpenStreetMap contributors (ODbL)"
@@ -166,21 +177,35 @@ async function createLead(
           ? "Google Places API"
           : options.sourceLabel,
     importJobId: options.jobId,
-  });
+    createdAt: timestamp,
+  };
+  await collections.sourceRecords.insertOne(source);
 
-  const contactValues: Array<typeof contactPoints.$inferInsert> = [];
-  const evidenceValues: Array<Omit<typeof evidenceRecords.$inferInsert, "workspaceId" | "businessId">> = [];
+  const contactValues: ContactPointDoc[] = [];
+  const evidenceValues: EvidenceRecordDoc[] = [];
 
   if (normalized.email) {
     contactValues.push({
+      _id: newId(),
       workspaceId: actor.workspaceId,
       businessId,
       type: "email",
       value: normalized.emailDisplay ?? normalized.email,
       normalizedValue: normalized.email,
+      label: null,
+      platform: null,
+      verifiedByUser: false,
       confidence: "medium",
+      firstSeenAt: timestamp,
+      lastSeenAt: timestamp,
+      createdAt: timestamp,
     });
     evidenceValues.push({
+      _id: newId(),
+      workspaceId: actor.workspaceId,
+      businessId,
+      contactPointId: null,
+      scanResultId: null,
       type: "email",
       originalValue: normalized.emailDisplay ?? normalized.email,
       normalizedValue: normalized.email,
@@ -188,19 +213,32 @@ async function createLead(
       method: "import",
       confidence: "medium",
       verificationStatus: "unverified",
+      firstSeenAt: timestamp,
+      lastSeenAt: timestamp,
     });
   }
   if (normalized.phone?.e164) {
     contactValues.push({
+      _id: newId(),
       workspaceId: actor.workspaceId,
       businessId,
       type: "phone",
       value: rawRecord.phone ?? normalized.phone.e164,
       normalizedValue: normalized.phone.e164,
       label: normalized.phone.kind,
+      platform: null,
+      verifiedByUser: false,
       confidence: "medium",
+      firstSeenAt: timestamp,
+      lastSeenAt: timestamp,
+      createdAt: timestamp,
     });
     evidenceValues.push({
+      _id: newId(),
+      workspaceId: actor.workspaceId,
+      businessId,
+      contactPointId: null,
+      scanResultId: null,
       type: "phone",
       originalValue: rawRecord.phone ?? normalized.phone.e164,
       normalizedValue: normalized.phone.e164,
@@ -208,27 +246,45 @@ async function createLead(
       method: "import",
       confidence: "medium",
       verificationStatus: "unverified",
+      firstSeenAt: timestamp,
+      lastSeenAt: timestamp,
     });
   } else if (rawRecord.phone) {
     contactValues.push({
+      _id: newId(),
       workspaceId: actor.workspaceId,
       businessId,
       type: "phone",
       value: rawRecord.phone,
       normalizedValue: rawRecord.phone.replace(/[^\d+]/g, ""),
       label: "unknown",
+      platform: null,
+      verifiedByUser: false,
       confidence: "low",
+      firstSeenAt: timestamp,
+      lastSeenAt: timestamp,
+      createdAt: timestamp,
     });
   }
 
-  if (contactValues.length) {
-    await db.insert(contactPoints).values(contactValues).onConflictDoNothing();
+  for (const contact of contactValues) {
+    await collections.contactPoints.updateOne(
+      { businessId, type: contact.type, normalizedValue: contact.normalizedValue },
+      { $setOnInsert: contact },
+      { upsert: true },
+    );
   }
-  if (evidenceValues.length) {
-    await db
-      .insert(evidenceRecords)
-      .values(evidenceValues.map((value) => ({ ...value, workspaceId: actor.workspaceId, businessId })))
-      .onConflictDoNothing();
+  for (const evidence of evidenceValues) {
+    await collections.evidenceRecords.updateOne(
+      {
+        businessId,
+        type: evidence.type,
+        originalValue: evidence.originalValue,
+        sourceUrl: evidence.sourceUrl,
+      },
+      { $setOnInsert: evidence },
+      { upsert: true },
+    );
   }
 
   const score = computeScore(
@@ -244,27 +300,25 @@ async function createLead(
       hasInquiryForm: false,
     },
     profile.config,
-    { profileId: profile.id, profileVersion: profile.version },
+    { profileId: profile._id, profileVersion: profile.version },
   );
 
-  const [scoreRow] = await db
-    .insert(scoreResults)
-    .values({
-      workspaceId: actor.workspaceId,
-      businessId,
-      profileId: profile.id,
-      profileVersion: profile.version,
-      total: score.total,
-      components: score.components,
-    })
-    .returning({ id: scoreResults.id });
+  const scoreRow: ScoreResultDoc = {
+    _id: newId(),
+    workspaceId: actor.workspaceId,
+    businessId,
+    profileId: profile._id,
+    profileVersion: profile.version,
+    total: score.total,
+    components: score.components,
+    calculatedAt: new Date(score.calculatedAt),
+  };
+  await collections.scoreResults.insertOne(scoreRow);
 
-  if (scoreRow) {
-    await db
-      .update(businesses)
-      .set({ latestScore: score.total, latestScoreResultId: scoreRow.id })
-      .where(and(eq(businesses.workspaceId, actor.workspaceId), eq(businesses.id, businessId)));
-  }
+  await collections.businesses.updateOne(
+    { workspaceId: actor.workspaceId, _id: businessId },
+    { $set: { latestScore: score.total, latestScoreResultId: scoreRow._id } },
+  );
 
   return businessId;
 }
@@ -293,12 +347,14 @@ export async function ingestRecords(options: IngestOptions): Promise<IngestCount
     if (!normalized.name || !normalized.normalizedName) {
       counts.skippedCount++;
       counts.errorCount++;
-      await db.insert(importRowErrors).values({
+      await collections.importRowErrors.insertOne({
+        _id: newId(),
         workspaceId: actor.workspaceId,
         importJobId: options.jobId,
         rowNumber: item.rowNumber,
         reason: `${item.sourceFile}: business name is missing or empty.`,
         raw: payloadFor(item.raw),
+        createdAt: now(),
       });
     } else {
       counts.validCount++;
@@ -309,17 +365,14 @@ export async function ingestRecords(options: IngestOptions): Promise<IngestCount
           ? `discovery://${options.source}/${encodeURIComponent(sourceId)}`
           : `import://${options.jobId}/${encodeURIComponent(item.sourceFile)}#row-${item.rowNumber}`;
 
-      const [existingSource] = await db
-        .select({ id: sourceRecords.id })
-        .from(sourceRecords)
-        .where(
-          and(
-            eq(sourceRecords.workspaceId, actor.workspaceId),
-            eq(sourceRecords.source, options.source),
-            eq(sourceRecords.sourceId, sourceId),
-          ),
-        )
-        .limit(1);
+      const existingSource = await collections.sourceRecords.findOne(
+        {
+          workspaceId: actor.workspaceId,
+          source: options.source,
+          sourceId,
+        },
+        { projection: { _id: 1 } },
+      );
 
       if (existingSource) {
         counts.duplicateCount++;
@@ -378,31 +431,36 @@ export async function finalizeImportJob(
   jobId: string,
   counts: IngestCounts,
 ): Promise<void> {
-  await db
-    .update(importJobs)
-    .set({
-      status: "completed",
-      progress: 100,
-      processedRows: counts.rowCount,
-      rowCount: counts.rowCount,
-      validCount: counts.validCount,
-      newCount: counts.newCount,
-      duplicateCount: counts.duplicateCount,
-      mergedCount: counts.mergedCount,
-      reviewCount: counts.reviewCount,
-      skippedCount: counts.skippedCount,
-      errorCount: counts.errorCount,
-      finishedAt: new Date(),
-    })
-    .where(and(eq(importJobs.workspaceId, actor.workspaceId), eq(importJobs.id, jobId)));
+  const finishedAt = now();
+  await collections.importJobs.updateOne(
+    { workspaceId: actor.workspaceId, _id: jobId },
+    {
+      $set: {
+        status: "completed",
+        progress: 100,
+        processedRows: counts.rowCount,
+        rowCount: counts.rowCount,
+        validCount: counts.validCount,
+        newCount: counts.newCount,
+        duplicateCount: counts.duplicateCount,
+        mergedCount: counts.mergedCount,
+        reviewCount: counts.reviewCount,
+        skippedCount: counts.skippedCount,
+        errorCount: counts.errorCount,
+        finishedAt,
+      },
+    },
+  );
 
-  await db.insert(activities).values({
+  await collections.activities.insertOne({
+    _id: newId(),
     workspaceId: actor.workspaceId,
     businessId: null,
     type: "imported",
     message: `Import finished: ${counts.newCount} new, ${counts.mergedCount} merged, ${counts.duplicateCount} duplicates, ${counts.skippedCount} skipped`,
     metadata: { importJobId: jobId, ...counts },
     actorId: actor.userId,
+    createdAt: finishedAt,
   });
 
   await publishEvent(actor.workspaceId, "import.completed", {

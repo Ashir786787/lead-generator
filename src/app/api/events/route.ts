@@ -6,15 +6,15 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
 /**
- * Server-sent events for this workspace only. The LISTEN connection filters by
- * workspace_id before anything is written to the client stream.
+ * Server-sent events for this workspace only. The poller queries Mongo with
+ * the workspace id, so no cross-workspace event can reach this stream.
  */
 export async function GET(request: Request) {
   const ctx = await getWorkspaceContext();
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
+    start(controller) {
       let closed = false;
       const send = (data: unknown): void => {
         if (closed) return;
@@ -26,10 +26,11 @@ export async function GET(request: Request) {
       };
       send({ type: "connected", workspaceId: ctx.workspaceId, ts: Date.now() });
 
-      const listener = await openEventListener((event) => {
-        if (event.workspaceId !== ctx.workspaceId) return;
-        send(event);
-      });
+      const listener = openEventListener(
+        ctx.workspaceId,
+        (event) => send(event),
+        request.signal,
+      );
 
       const heartbeat = setInterval(() => {
         if (closed) return;
@@ -44,7 +45,7 @@ export async function GET(request: Request) {
         if (closed) return;
         closed = true;
         clearInterval(heartbeat);
-        void listener.close().catch(() => undefined);
+        listener.close();
         try {
           controller.close();
         } catch {

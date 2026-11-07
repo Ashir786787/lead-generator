@@ -1,7 +1,6 @@
 import { cookies, headers } from "next/headers";
-import { and, asc, eq } from "drizzle-orm";
-import { db } from "@/lib/db";
-import { memberships, workspaces } from "@/lib/db/schema";
+import { collections } from "@/lib/db";
+import type { MembershipDoc, WorkspaceDoc } from "@/lib/db/types";
 import { auth } from "@/lib/auth";
 import { WORKSPACE_COOKIE } from "@/lib/constants";
 import { unauthorized, forbidden } from "@/lib/api/errors";
@@ -32,6 +31,30 @@ export interface WorkspaceContext {
   workspaces: WorkspaceSummary[];
 }
 
+interface WorkspaceRow extends WorkspaceDoc {
+  role: "owner" | "member";
+}
+
+async function workspaceRowsForUser(userId: string): Promise<WorkspaceRow[]> {
+  const memberships = await collections.memberships.find({ userId }).toArray();
+  if (memberships.length === 0) return [];
+  const workspaceIds = memberships.map((membership) => membership.workspaceId);
+  const workspaces = await collections.workspaces
+    .find({ _id: { $in: workspaceIds } })
+    .toArray();
+  const byId = new Map(workspaces.map((workspace) => [workspace._id, workspace]));
+  const rows: WorkspaceRow[] = [];
+  for (const membership of memberships as MembershipDoc[]) {
+    const workspace = byId.get(membership.workspaceId);
+    if (workspace) rows.push({ ...workspace, role: membership.role });
+  }
+  return rows.sort(
+    (a, b) =>
+      Number(a.isDemo) - Number(b.isDemo) ||
+      a.createdAt.getTime() - b.createdAt.getTime(),
+  );
+}
+
 export async function getSessionUser(): Promise<SessionUser | null> {
   const session = await auth.api.getSession({ headers: await headers() });
   if (!session?.user) return null;
@@ -39,20 +62,9 @@ export async function getSessionUser(): Promise<SessionUser | null> {
 }
 
 export async function listWorkspacesForUser(userId: string): Promise<WorkspaceSummary[]> {
-  const rows = await db
-    .select({
-      id: workspaces.id,
-      name: workspaces.name,
-      slug: workspaces.slug,
-      isDemo: workspaces.isDemo,
-      role: memberships.role,
-    })
-    .from(memberships)
-    .innerJoin(workspaces, eq(memberships.workspaceId, workspaces.id))
-    .where(eq(memberships.userId, userId))
-    .orderBy(asc(workspaces.isDemo), asc(workspaces.createdAt));
+  const rows = await workspaceRowsForUser(userId);
   return rows.map((row) => ({
-    id: row.id,
+    id: row._id,
     name: row.name,
     slug: row.slug,
     isDemo: row.isDemo,
@@ -68,34 +80,19 @@ export async function getWorkspaceContext(): Promise<WorkspaceContext> {
   const sessionUser = await getSessionUser();
   if (!sessionUser) throw unauthorized();
 
-  const rows = await db
-    .select({
-      id: workspaces.id,
-      name: workspaces.name,
-      slug: workspaces.slug,
-      isDemo: workspaces.isDemo,
-      timezone: workspaces.timezone,
-      countryNotes: workspaces.countryNotes,
-      role: memberships.role,
-      createdAt: workspaces.createdAt,
-    })
-    .from(memberships)
-    .innerJoin(workspaces, eq(memberships.workspaceId, workspaces.id))
-    .where(eq(memberships.userId, sessionUser.id))
-    .orderBy(asc(workspaces.isDemo), asc(workspaces.createdAt));
-
+  const rows = await workspaceRowsForUser(sessionUser.id);
   if (rows.length === 0) {
     throw forbidden("Your account is not attached to a workspace. Run the first-run setup again.");
   }
 
   const cookieStore = await cookies();
   const requested = cookieStore.get(WORKSPACE_COOKIE)?.value;
-  const active = rows.find((row) => row.id === requested) ?? rows[0];
+  const active = rows.find((row) => row._id === requested) ?? rows[0];
   if (!active) throw forbidden("No workspace available.");
 
   return {
     user: sessionUser,
-    workspaceId: active.id,
+    workspaceId: active._id,
     workspaceName: active.name,
     workspaceSlug: active.slug,
     isDemo: active.isDemo,
@@ -103,7 +100,7 @@ export async function getWorkspaceContext(): Promise<WorkspaceContext> {
     timezone: active.timezone,
     countryNotes: active.countryNotes ?? {},
     workspaces: rows.map((row) => ({
-      id: row.id,
+      id: row._id,
       name: row.name,
       slug: row.slug,
       isDemo: row.isDemo,
@@ -113,10 +110,6 @@ export async function getWorkspaceContext(): Promise<WorkspaceContext> {
 }
 
 export async function assertWorkspaceMembership(userId: string, workspaceId: string): Promise<void> {
-  const [row] = await db
-    .select({ id: memberships.id })
-    .from(memberships)
-    .where(and(eq(memberships.userId, userId), eq(memberships.workspaceId, workspaceId)))
-    .limit(1);
+  const row = await collections.memberships.findOne({ userId, workspaceId });
   if (!row) throw forbidden();
 }

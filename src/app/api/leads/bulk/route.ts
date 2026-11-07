@@ -4,10 +4,8 @@ import { apiRoute } from "@/lib/api/route";
 import { getWorkspaceContext } from "@/lib/auth/session";
 import { bulkAddTag, bulkArchive, bulkSetStatus } from "@/lib/data/mutations";
 import { queueScans } from "@/lib/scan/service";
-import { getWorkerHealth, isScanWorkerOnline } from "@/lib/jobs/health";
 import { PIPELINE_STATUSES } from "@/lib/constants";
 import { checkRateLimit } from "@/lib/api/rate-limit";
-import { env } from "@/lib/env";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -50,7 +48,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ affected: await bulkArchive(ctx, body.ids) });
     }
     const results = await queueScans(ctx, body.ids, Boolean(body.force));
-    const workerOnline = isScanWorkerOnline(await getWorkerHealth());
-    return NextResponse.json({ results, workerOnline, inline: env.inlineJobs }, { status: 202 });
+    // Scans run inside this request, so the UI never has to wait for a worker.
+    return NextResponse.json({ results, workerOnline: true, inline: true }, { status: 202 });
   });
 }

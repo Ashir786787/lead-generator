@@ -1,12 +1,16 @@
 import "dotenv/config";
-import { migrate } from "drizzle-orm/node-postgres/migrator";
-import { db, pool } from "@/lib/db";
+import { closeMongo, connectMongo } from "@/lib/db";
+import { ensureIndexes } from "@/lib/db/indexes";
 import { env } from "@/lib/env";
 import { logger } from "@/lib/logger";
 
+function maskedUri(uri: string): string {
+  return uri.replace(/\/\/([^:/@]+):([^@]+)@/, "//$1:***@");
+}
+
 /**
- * Drops and rebuilds the schema of the configured database, then re-applies the
- * migrations. Destructive by design, so it refuses to run unless:
+ * Drops the configured MongoDB database and recreates the indexes. Destructive
+ * by design, so it refuses to run unless:
  *   - NODE_ENV is not "production", and
  *   - the caller passes --yes (or sets RESET_DB_CONFIRM=yes).
  *
@@ -20,7 +24,7 @@ async function main(): Promise<void> {
       [
         "Refusing to reset the database without confirmation.",
         "This permanently deletes every workspace, lead, scan and import in:",
-        `  ${env.databaseUrl.replace(/:[^:@/]+@/, ":***@")}`,
+        `  ${maskedUri(env.mongoUri)} (database: ${env.mongoDbName})`,
         "",
         "Re-run with:  pnpm db:reset --yes",
       ].join("\n"),
@@ -29,24 +33,19 @@ async function main(): Promise<void> {
     return;
   }
   if (env.isProduction) {
-    console.error("Refusing to reset a production database.");
+    console.error("Refusing to reset the database while NODE_ENV=production.");
     process.exitCode = 1;
     return;
   }
 
-  logger.warn({ database: env.databaseUrl.replace(/:[^:@/]+@/, ":***@") }, "Resetting database schema");
-
-  const client = await pool.connect();
+  const db = await connectMongo();
   try {
-    await client.query("SELECT pg_advisory_lock(918273645)");
-    await client.query("DROP SCHEMA IF EXISTS public CASCADE");
-    await client.query("CREATE SCHEMA public");
-    await migrate(db, { migrationsFolder: "src/lib/db/migrations" });
-    logger.info("Database reset and migrations applied.");
+    await db.dropDatabase();
+    logger.warn({ database: env.mongoDbName }, "Database dropped.");
+    await ensureIndexes(db);
+    logger.info({ database: env.mongoDbName }, "Database reset and indexes recreated.");
   } finally {
-    await client.query("SELECT pg_advisory_unlock(918273645)").catch(() => undefined);
-    client.release();
-    await pool.end();
+    await closeMongo();
   }
 }
 

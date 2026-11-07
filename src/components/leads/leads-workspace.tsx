@@ -163,7 +163,6 @@ export function LeadsWorkspace() {
       const result = await apiFetch<{
         affected?: number;
         results?: Array<{ scanJobId: string | null; reason?: string; outcome?: string }>;
-        workerOnline?: boolean;
         inline?: boolean;
       }>(
         "/api/leads/bulk",
@@ -175,24 +174,12 @@ export function LeadsWorkspace() {
       if (action === "scan") {
         const queued = result.results?.filter((item) => item.scanJobId).length ?? 0;
         const skipped = (result.results?.length ?? 0) - queued;
-        if (result.inline) {
-          const needReview = result.results?.filter((item) => item.outcome && item.outcome !== "success").length ?? 0;
-          toast.success(
-            queued
-              ? `Scanned ${queued} website${queued === 1 ? "" : "s"}${needReview ? `, ${needReview} need review` : ""}${skipped ? `, skipped ${skipped}` : ""}.`
-              : "No scans were run. Check that these leads have websites.",
-          );
-        } else if (queued && result.workerOnline === false) {
-          toast.warning(
-            `Queued ${queued} website scan${queued === 1 ? "" : "s"}, but the scan worker is offline. Start it with pnpm worker.`,
-          );
-        } else {
-          toast.success(
-            queued
-              ? `Queued ${queued} website scan${queued === 1 ? "" : "s"}${skipped ? `, skipped ${skipped}` : ""}.`
-              : "No scans were queued. Check that these leads have websites.",
-          );
-        }
+        const needReview = result.results?.filter((item) => item.outcome && item.outcome !== "success").length ?? 0;
+        toast.success(
+          queued
+            ? `Scanned ${queued} website${queued === 1 ? "" : "s"}${needReview ? `, ${needReview} need review` : ""}${skipped ? `, skipped ${skipped}` : ""}.`
+            : "No scans were run. Check that these leads have websites.",
+        );
       } else if (action === "archive") {
         toast.success(`Archived ${result.affected ?? selectedIds.length} lead${selectedIds.length === 1 ? "" : "s"}.`);
       } else {
@@ -213,14 +200,15 @@ export function LeadsWorkspace() {
   async function scanOne(leadId: string) {
     try {
       const result = await apiFetch<{
-        results: Array<{ scanJobId: string | null; reason?: string }>;
-        workerOnline?: boolean;
+        results: Array<{ scanJobId: string | null; reason?: string; outcome?: string }>;
       }>(`/api/leads/${leadId}/scan`, { method: "POST", body: JSON.stringify({}) });
       const queued = result.results[0];
-      if (queued?.scanJobId && result.workerOnline === false) {
-        toast.warning("Scan queued, but the scan worker is offline. Start it with pnpm worker.");
-      } else if (queued?.scanJobId) toast.success("Website scan queued.");
-      else if (queued?.reason === "no_website") toast.error("This lead has no website to scan.");
+      if (queued?.scanJobId) {
+        if (queued.outcome === "success") toast.success("Website scan completed.");
+        else if (queued.outcome === "cancelled") toast.info("Scan cancelled.");
+        else if (queued.outcome) toast.warning(`Website scan finished with “${queued.outcome}”. Check the scan details.`);
+        else toast.success("Website scan finished.");
+      } else if (queued?.reason === "no_website") toast.error("This lead has no website to scan.");
       else if (queued?.reason === "already_running") toast.info("A scan is already running for this lead.");
       else toast.error("Could not queue this scan.");
       await queryClient.invalidateQueries({ queryKey: ["leads"] });

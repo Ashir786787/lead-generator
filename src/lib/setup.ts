@@ -1,6 +1,4 @@
-import { count, eq } from "drizzle-orm";
-import { db } from "@/lib/db";
-import { user } from "@/lib/db/schema";
+import { collections } from "@/lib/db";
 
 export interface SetupStatus {
   needsSetup: boolean;
@@ -9,8 +7,7 @@ export interface SetupStatus {
 }
 
 export async function getSetupStatus(): Promise<SetupStatus> {
-  const [row] = await db.select({ value: count() }).from(user);
-  const userCount = Number(row?.value ?? 0);
+  const userCount = await collections.user.countDocuments();
   return {
     needsSetup: userCount === 0,
     userCount,
@@ -24,10 +21,6 @@ export async function ownerHint(): Promise<string> {
 
 /** True when the workspace row exists and is attached to at least one owner. */
 export async function firstWorkspaceId(): Promise<string | null> {
-  const [row] = await db
-    .select({ id: user.id })
-    .from(user)
-    .where(eq(user.id, user.id))
-    .limit(1);
-  return row?.id ?? null;
+  const row = await collections.user.findOne({}, { projection: { _id: 1 } });
+  return row?._id ?? null;
 }

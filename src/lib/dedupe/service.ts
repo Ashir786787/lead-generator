@@ -1,19 +1,16 @@
-import { and, desc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
-import { alias } from "drizzle-orm/pg-core";
-import { db } from "@/lib/db";
-import {
-  activities,
-  businesses,
-  businessTags,
-  contactPoints,
-  duplicateCandidates,
-  evidenceRecords,
-  mergeHistory,
-  notes,
-  sourceRecords,
-} from "@/lib/db/schema";
+import type { Filter } from "mongodb";
+import { collections, newId, now, withTransaction } from "@/lib/db";
+import type {
+  ActivityDoc,
+  BusinessDoc,
+  ContactPointDoc,
+  EvidenceRecordDoc,
+  MergeHistoryDoc,
+  SourceRecordDoc,
+} from "@/lib/db/types";
 import type { ActorContext } from "@/lib/data/types";
 import { decideDuplicate, type DedupeDecision, type DedupeRecord } from "./decide";
+import { nameTokens } from "@/lib/normalize/text";
 import { recalculateLeadScore } from "@/lib/score/service";
 import { publishEvent } from "@/lib/events/bus";
 import { notFound, conflict } from "@/lib/api/errors";
@@ -23,14 +20,7 @@ export interface MatchResult {
   decision: DedupeDecision;
 }
 
-function toRecord(row: {
-  name: string;
-  phoneE164: string | null;
-  websiteHost: string | null;
-  street: string | null;
-  lat: number | null;
-  lng: number | null;
-}): DedupeRecord {
+function toRecord(row: BusinessDoc): DedupeRecord {
   return {
     name: row.name,
     phoneE164: row.phoneE164,
@@ -53,45 +43,31 @@ export async function findBestMatch(
     hostVariants.add(`www.${host}`);
   }
 
-  const signals = [];
-  if (incoming.phoneE164) signals.push(eq(businesses.phoneE164, incoming.phoneE164));
-  if (hostVariants.size) signals.push(inArray(businesses.websiteHost, [...hostVariants]));
-  if (incoming.name) {
-    signals.push(sql`similarity(${businesses.normalizedName}, ${incoming.name}) > 0.45`);
-  }
+  const signals: Filter<BusinessDoc>[] = [];
+  if (incoming.phoneE164) signals.push({ phoneE164: incoming.phoneE164 });
+  if (hostVariants.size) signals.push({ websiteHost: { $in: [...hostVariants] } });
+  const tokens = nameTokens(incoming.name);
+  if (tokens.length) signals.push({ nameTokens: { $in: tokens } });
   if (!signals.length) return null;
 
-  const conditions = [
-    eq(businesses.workspaceId, workspaceId),
-    isNull(businesses.mergedIntoId),
-    or(...signals),
-  ];
-  if (excludeBusinessId) conditions.push(sql`${businesses.id} <> ${excludeBusinessId}`);
+  const filter: Filter<BusinessDoc> = {
+    workspaceId,
+    mergedIntoId: null,
+    $or: signals,
+  };
+  if (excludeBusinessId) filter._id = { $ne: excludeBusinessId };
 
-  const rows = await db
-    .select({
-      id: businesses.id,
-      name: businesses.name,
-      phoneE164: businesses.phoneE164,
-      websiteHost: businesses.websiteHost,
-      street: businesses.street,
-      lat: businesses.lat,
-      lng: businesses.lng,
-    })
-    .from(businesses)
-    .where(and(...conditions))
-    .orderBy(sql`similarity(${businesses.normalizedName}, ${incoming.name}) desc`)
-    .limit(25);
+  const rows = await collections.businesses.find(filter).limit(75).toArray();
 
   let bestMerge: MatchResult | null = null;
   let bestReview: MatchResult | null = null;
   for (const row of rows) {
     const decision = decideDuplicate(incoming, toRecord(row));
     if (decision.action === "merge" && (!bestMerge || decision.similarity > bestMerge.decision.similarity)) {
-      bestMerge = { candidateId: row.id, decision };
+      bestMerge = { candidateId: row._id, decision };
     }
     if (decision.action === "review" && (!bestReview || decision.similarity > bestReview.decision.similarity)) {
-      bestReview = { candidateId: row.id, decision };
+      bestReview = { candidateId: row._id, decision };
     }
   }
   return bestMerge ?? bestReview;
@@ -104,32 +80,31 @@ export async function recordDuplicateCandidate(
   decision: DedupeDecision,
 ): Promise<void> {
   const [left, right] = [businessAId, businessBId].sort();
-  await db
-    .insert(duplicateCandidates)
-    .values({
-      workspaceId,
-      businessAId: left,
-      businessBId: right,
-      similarity: decision.similarity,
-      distanceM: decision.distanceM,
-      reasons: [decision.reason],
-      status: "pending",
-    })
-    .onConflictDoNothing();
+  await collections.duplicateCandidates.updateOne(
+    { workspaceId, businessAId: left, businessBId: right },
+    {
+      $setOnInsert: {
+        _id: newId(),
+        workspaceId,
+        businessAId: left,
+        businessBId: right,
+        similarity: decision.similarity,
+        distanceM: decision.distanceM,
+        reasons: [decision.reason],
+        status: "pending",
+        createdAt: now(),
+        resolvedAt: null,
+        resolvedBy: null,
+      },
+    },
+    { upsert: true },
+  );
   await publishEvent(workspaceId, "duplicate.detected", { businessId: right });
 }
 
-interface SerializedBusiness {
-  [key: string]: unknown;
-}
-
 interface MergeSnapshot {
-  business: SerializedBusiness;
+  business: Record<string, unknown>;
   filledFields: string[];
-  /**
-   * Duplicate candidates that this merge resolved. Undo reopens them so the
-   * reviewer can decide again; older snapshots may not have the field.
-   */
   resolvedCandidateIds?: string[];
   keptBefore: {
     contactIds: string[];
@@ -153,6 +128,13 @@ function iso(value: Date | null | undefined): string | null {
   return value ? value.toISOString() : null;
 }
 
+function toDate(value: unknown): Date | null {
+  if (value instanceof Date) return value;
+  if (typeof value !== "string") return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 /**
  * Merge `mergedId` into `keptId`. Notes, status, follow-ups, locks and all source
  * references survive. The merged row is retained (archived) so undo is possible.
@@ -164,72 +146,66 @@ export async function mergeBusinesses(
 ): Promise<{ keptId: string; mergedId: string; mergeId: string }> {
   if (keptId === mergedId) throw conflict("Cannot merge a business with itself.");
 
-  const mergeId = await db.transaction(async (tx) => {
-    const [kept] = await tx
-      .select()
-      .from(businesses)
-      .where(and(eq(businesses.workspaceId, ctx.workspaceId), eq(businesses.id, keptId)))
-      .for("update");
-    const [merged] = await tx
-      .select()
-      .from(businesses)
-      .where(and(eq(businesses.workspaceId, ctx.workspaceId), eq(businesses.id, mergedId)))
-      .for("update");
+  const mergeId = await withTransaction(async (session) => {
+    const opt = { session };
+    const kept = await collections.businesses.findOne(
+      { workspaceId: ctx.workspaceId, _id: keptId },
+      opt,
+    );
+    const merged = await collections.businesses.findOne(
+      { workspaceId: ctx.workspaceId, _id: mergedId },
+      opt,
+    );
     if (!kept || !merged) throw notFound("One of the businesses was not found.");
     if (merged.mergedIntoId) throw conflict("That business has already been merged.");
 
-    const keptContacts = await tx
-      .select()
-      .from(contactPoints)
-      .where(and(eq(contactPoints.workspaceId, ctx.workspaceId), eq(contactPoints.businessId, keptId)));
-    const mergedContacts = await tx
-      .select()
-      .from(contactPoints)
-      .where(and(eq(contactPoints.workspaceId, ctx.workspaceId), eq(contactPoints.businessId, mergedId)));
-    const keptSources = await tx
-      .select()
-      .from(sourceRecords)
-      .where(and(eq(sourceRecords.workspaceId, ctx.workspaceId), eq(sourceRecords.businessId, keptId)));
-    const mergedSources = await tx
-      .select()
-      .from(sourceRecords)
-      .where(and(eq(sourceRecords.workspaceId, ctx.workspaceId), eq(sourceRecords.businessId, mergedId)));
-    const keptEvidence = await tx
-      .select()
-      .from(evidenceRecords)
-      .where(and(eq(evidenceRecords.workspaceId, ctx.workspaceId), eq(evidenceRecords.businessId, keptId)));
-    const mergedEvidence = await tx
-      .select()
-      .from(evidenceRecords)
-      .where(and(eq(evidenceRecords.workspaceId, ctx.workspaceId), eq(evidenceRecords.businessId, mergedId)));
-    const keptNotes = await tx
-      .select({ id: notes.id })
-      .from(notes)
-      .where(and(eq(notes.workspaceId, ctx.workspaceId), eq(notes.businessId, keptId)));
-    const mergedNotes = await tx
-      .select({ id: notes.id })
-      .from(notes)
-      .where(and(eq(notes.workspaceId, ctx.workspaceId), eq(notes.businessId, mergedId)));
-    const keptActivities = await tx
-      .select({ id: activities.id })
-      .from(activities)
-      .where(and(eq(activities.workspaceId, ctx.workspaceId), eq(activities.businessId, keptId)));
-    const mergedActivities = await tx
-      .select({ id: activities.id })
-      .from(activities)
-      .where(and(eq(activities.workspaceId, ctx.workspaceId), eq(activities.businessId, mergedId)));
-    const keptTags = await tx
-      .select({ tagId: businessTags.tagId })
-      .from(businessTags)
-      .where(and(eq(businessTags.workspaceId, ctx.workspaceId), eq(businessTags.businessId, keptId)));
-    const mergedTags = await tx
-      .select({ tagId: businessTags.tagId })
-      .from(businessTags)
-      .where(and(eq(businessTags.workspaceId, ctx.workspaceId), eq(businessTags.businessId, mergedId)));
+    const [keptContacts, mergedContacts, keptSources, mergedSources, keptEvidence, mergedEvidence] =
+      await Promise.all([
+        collections.contactPoints
+          .find({ workspaceId: ctx.workspaceId, businessId: keptId }, opt)
+          .toArray(),
+        collections.contactPoints
+          .find({ workspaceId: ctx.workspaceId, businessId: mergedId }, opt)
+          .toArray(),
+        collections.sourceRecords
+          .find({ workspaceId: ctx.workspaceId, businessId: keptId }, opt)
+          .toArray(),
+        collections.sourceRecords
+          .find({ workspaceId: ctx.workspaceId, businessId: mergedId }, opt)
+          .toArray(),
+        collections.evidenceRecords
+          .find({ workspaceId: ctx.workspaceId, businessId: keptId }, opt)
+          .toArray(),
+        collections.evidenceRecords
+          .find({ workspaceId: ctx.workspaceId, businessId: mergedId }, opt)
+          .toArray(),
+      ]);
+
+    const [keptNotes, mergedNotes, keptActivities, mergedActivities, keptTags, mergedTags] =
+      await Promise.all([
+        collections.notes
+          .find({ workspaceId: ctx.workspaceId, businessId: keptId }, { ...opt, projection: { _id: 1 } })
+          .toArray(),
+        collections.notes
+          .find({ workspaceId: ctx.workspaceId, businessId: mergedId }, { ...opt, projection: { _id: 1 } })
+          .toArray(),
+        collections.activities
+          .find({ workspaceId: ctx.workspaceId, businessId: keptId }, { ...opt, projection: { _id: 1 } })
+          .toArray(),
+        collections.activities
+          .find({ workspaceId: ctx.workspaceId, businessId: mergedId }, { ...opt, projection: { _id: 1 } })
+          .toArray(),
+        collections.businessTags
+          .find({ workspaceId: ctx.workspaceId, businessId: keptId }, opt)
+          .toArray(),
+        collections.businessTags
+          .find({ workspaceId: ctx.workspaceId, businessId: mergedId }, opt)
+          .toArray(),
+      ]);
 
     const locked = new Set(kept.fieldLocks ?? []);
     const filledFields: string[] = [];
-    const updates: Record<string, unknown> = { updatedAt: new Date() };
+    const updates: Partial<BusinessDoc> = { updatedAt: now() };
     const fields = [
       "phone",
       "phoneE164",
@@ -252,77 +228,80 @@ export async function mergeBusinesses(
       const current = keptRecord[field];
       const incoming = mergedRecord[field];
       if ((current === null || current === undefined || current === "") && incoming != null && !locked.has(field)) {
-        updates[field] = incoming;
+        (updates as Record<string, unknown>)[field] = incoming;
         filledFields.push(field);
       }
     }
-    if (
-      merged.lastCheckedAt &&
-      (!kept.lastCheckedAt || merged.lastCheckedAt > kept.lastCheckedAt)
-    ) {
+    if (merged.lastCheckedAt && (!kept.lastCheckedAt || merged.lastCheckedAt > kept.lastCheckedAt)) {
       updates.latestScanId = merged.latestScanId;
       updates.latestScanOutcome = merged.latestScanOutcome;
       updates.latestChatbotResult = merged.latestChatbotResult;
       updates.lastCheckedAt = merged.lastCheckedAt;
     }
+    if (merged.hasWhatsapp) updates.hasWhatsapp = true;
 
-    await tx
-      .update(businesses)
-      .set(updates)
-      .where(and(eq(businesses.workspaceId, ctx.workspaceId), eq(businesses.id, keptId)));
+    await collections.businesses.updateOne(
+      { workspaceId: ctx.workspaceId, _id: keptId },
+      { $set: updates },
+      opt,
+    );
 
     for (const contact of mergedContacts) {
-      await tx
-        .insert(contactPoints)
-        .values({
-          workspaceId: ctx.workspaceId,
+      const existing = await collections.contactPoints.findOne(
+        {
           businessId: keptId,
           type: contact.type,
-          value: contact.value,
           normalizedValue: contact.normalizedValue,
-          label: contact.label,
-          platform: contact.platform,
-          verifiedByUser: contact.verifiedByUser,
-          confidence: contact.confidence,
-          firstSeenAt: contact.firstSeenAt,
-          lastSeenAt: contact.lastSeenAt,
-        })
-        .onConflictDoUpdate({
-          target: [contactPoints.businessId, contactPoints.type, contactPoints.normalizedValue],
-          set: {
-            lastSeenAt: sql`greatest(${contactPoints.lastSeenAt}, excluded.last_seen_at)`,
-            verifiedByUser: sql`${contactPoints.verifiedByUser} or excluded.verified_by_user`,
+        },
+        opt,
+      );
+      if (existing) {
+        await collections.contactPoints.updateOne(
+          { _id: existing._id },
+          {
+            $max: { lastSeenAt: contact.lastSeenAt },
+            $set: { verifiedByUser: existing.verifiedByUser || contact.verifiedByUser },
           },
-        });
+          opt,
+        );
+      } else {
+        const { _id: _ignored, businessId: _ignoredBusiness, ...rest } = contact;
+        await collections.contactPoints.insertOne(
+          { ...rest, _id: newId(), workspaceId: ctx.workspaceId, businessId: keptId },
+          opt,
+        );
+      }
     }
     if (mergedContacts.length) {
-      await tx
-        .delete(contactPoints)
-        .where(and(eq(contactPoints.workspaceId, ctx.workspaceId), eq(contactPoints.businessId, mergedId)));
+      await collections.contactPoints.deleteMany(
+        { workspaceId: ctx.workspaceId, businessId: mergedId },
+        opt,
+      );
     }
 
     for (const evidence of mergedEvidence) {
-      await tx
-        .insert(evidenceRecords)
-        .values({
-          workspaceId: ctx.workspaceId,
+      const existing = await collections.evidenceRecords.findOne(
+        {
           businessId: keptId,
           type: evidence.type,
           originalValue: evidence.originalValue,
-          normalizedValue: evidence.normalizedValue,
           sourceUrl: evidence.sourceUrl,
-          method: evidence.method,
-          confidence: evidence.confidence,
-          verificationStatus: evidence.verificationStatus,
-          firstSeenAt: evidence.firstSeenAt,
-          lastSeenAt: evidence.lastSeenAt,
-        })
-        .onConflictDoNothing();
+        },
+        opt,
+      );
+      if (!existing) {
+        const { _id: _ignored, businessId: _ignoredBusiness, ...rest } = evidence;
+        await collections.evidenceRecords.insertOne(
+          { ...rest, _id: newId(), workspaceId: ctx.workspaceId, businessId: keptId },
+          opt,
+        );
+      }
     }
     if (mergedEvidence.length) {
-      await tx
-        .delete(evidenceRecords)
-        .where(and(eq(evidenceRecords.workspaceId, ctx.workspaceId), eq(evidenceRecords.businessId, mergedId)));
+      await collections.evidenceRecords.deleteMany(
+        { workspaceId: ctx.workspaceId, businessId: mergedId },
+        opt,
+      );
     }
 
     for (const source of mergedSources) {
@@ -330,112 +309,129 @@ export async function mergeBusinesses(
         (existing) => existing.source === source.source && existing.sourceId === source.sourceId,
       );
       if (duplicate) {
-        await tx.delete(sourceRecords).where(eq(sourceRecords.id, source.id));
+        await collections.sourceRecords.deleteOne({ _id: source._id }, opt);
       } else {
-        await tx.update(sourceRecords).set({ businessId: keptId }).where(eq(sourceRecords.id, source.id));
+        await collections.sourceRecords.updateOne(
+          { _id: source._id },
+          { $set: { businessId: keptId } },
+          opt,
+        );
       }
     }
 
-    if (mergedNotes.length) {
-      await tx
-        .update(notes)
-        .set({ businessId: keptId })
-        .where(and(eq(notes.workspaceId, ctx.workspaceId), eq(notes.businessId, mergedId)));
-    }
-    if (mergedActivities.length) {
-      await tx
-        .update(activities)
-        .set({ businessId: keptId })
-        .where(and(eq(activities.workspaceId, ctx.workspaceId), eq(activities.businessId, mergedId)));
-    }
+    await collections.notes.updateMany(
+      { workspaceId: ctx.workspaceId, businessId: mergedId },
+      { $set: { businessId: keptId } },
+      opt,
+    );
+    await collections.activities.updateMany(
+      { workspaceId: ctx.workspaceId, businessId: mergedId },
+      { $set: { businessId: keptId } },
+      opt,
+    );
 
     if (mergedTags.length) {
-      await tx
-        .insert(businessTags)
-        .values(mergedTags.map((tag) => ({ workspaceId: ctx.workspaceId, businessId: keptId, tagId: tag.tagId })))
-        .onConflictDoNothing();
-      await tx
-        .delete(businessTags)
-        .where(and(eq(businessTags.workspaceId, ctx.workspaceId), eq(businessTags.businessId, mergedId)));
+      for (const tag of mergedTags) {
+        const id = `${keptId}:${tag.tagId}`;
+        await collections.businessTags.updateOne(
+          { _id: id },
+          { $setOnInsert: { _id: id, workspaceId: ctx.workspaceId, businessId: keptId, tagId: tag.tagId } },
+          { ...opt, upsert: true },
+        );
+      }
+      await collections.businessTags.deleteMany(
+        { workspaceId: ctx.workspaceId, businessId: mergedId },
+        opt,
+      );
     }
 
-    await tx
-      .update(businesses)
-      .set({ mergedIntoId: keptId, archivedAt: new Date(), updatedAt: new Date() })
-      .where(and(eq(businesses.workspaceId, ctx.workspaceId), eq(businesses.id, mergedId)));
+    const timestamp = now();
+    await collections.businesses.updateOne(
+      { workspaceId: ctx.workspaceId, _id: mergedId },
+      { $set: { mergedIntoId: keptId, archivedAt: timestamp, updatedAt: timestamp } },
+      opt,
+    );
 
-    const pendingCandidates = await tx
-      .select({ id: duplicateCandidates.id })
-      .from(duplicateCandidates)
-      .where(
-        and(
-          eq(duplicateCandidates.workspaceId, ctx.workspaceId),
-          eq(duplicateCandidates.status, "pending"),
-          or(
-            eq(duplicateCandidates.businessAId, mergedId),
-            eq(duplicateCandidates.businessBId, mergedId),
-          ),
-        ),
-      );
+    const pendingCandidates = await collections.duplicateCandidates
+      .find(
+        {
+          workspaceId: ctx.workspaceId,
+          status: "pending",
+          $or: [{ businessAId: mergedId }, { businessBId: mergedId }],
+        },
+        { ...opt, projection: { _id: 1 } },
+      )
+      .toArray();
 
-    await tx
-      .update(duplicateCandidates)
-      .set({ status: "merged", resolvedAt: new Date(), resolvedBy: ctx.user.id })
-      .where(
-        and(
-          eq(duplicateCandidates.workspaceId, ctx.workspaceId),
-          eq(duplicateCandidates.status, "pending"),
-          or(
-            eq(duplicateCandidates.businessAId, mergedId),
-            eq(duplicateCandidates.businessBId, mergedId),
-          ),
-        ),
-      );
+    await collections.duplicateCandidates.updateMany(
+      {
+        workspaceId: ctx.workspaceId,
+        status: "pending",
+        $or: [{ businessAId: mergedId }, { businessBId: mergedId }],
+      },
+      { $set: { status: "merged", resolvedAt: timestamp, resolvedBy: ctx.user.id } },
+      opt,
+    );
 
     const snapshot: MergeSnapshot = {
       business: JSON.parse(JSON.stringify(merged)),
       filledFields,
-      resolvedCandidateIds: pendingCandidates.map((row) => row.id),
+      resolvedCandidateIds: pendingCandidates.map((row) => row._id),
       keptBefore: {
-        contactIds: keptContacts.map((row) => row.id),
-        sourceIds: keptSources.map((row) => row.id),
-        evidenceIds: keptEvidence.map((row) => row.id),
-        noteIds: keptNotes.map((row) => row.id),
-        activityIds: keptActivities.map((row) => row.id),
+        contactIds: keptContacts.map((row) => row._id),
+        sourceIds: keptSources.map((row) => row._id),
+        evidenceIds: keptEvidence.map((row) => row._id),
+        noteIds: keptNotes.map((row) => row._id),
+        activityIds: keptActivities.map((row) => row._id),
         tagIds: keptTags.map((row) => row.tagId),
       },
       merged: {
-        contacts: mergedContacts.map((row) => ({ ...row, firstSeenAt: iso(row.firstSeenAt), lastSeenAt: iso(row.lastSeenAt), createdAt: iso(row.createdAt) })),
+        contacts: mergedContacts.map((row) => ({
+          ...row,
+          firstSeenAt: iso(row.firstSeenAt),
+          lastSeenAt: iso(row.lastSeenAt),
+          createdAt: iso(row.createdAt),
+        })),
         sources: mergedSources.map((row) => ({ ...row, createdAt: iso(row.createdAt) })),
-        evidence: mergedEvidence.map((row) => ({ ...row, firstSeenAt: iso(row.firstSeenAt), lastSeenAt: iso(row.lastSeenAt) })),
-        noteIds: mergedNotes.map((row) => row.id),
-        activityIds: mergedActivities.map((row) => row.id),
+        evidence: mergedEvidence.map((row) => ({
+          ...row,
+          firstSeenAt: iso(row.firstSeenAt),
+          lastSeenAt: iso(row.lastSeenAt),
+        })),
+        noteIds: mergedNotes.map((row) => row._id),
+        activityIds: mergedActivities.map((row) => row._id),
         tagIds: mergedTags.map((row) => row.tagId),
       },
     };
 
-    const [history] = await tx
-      .insert(mergeHistory)
-      .values({
-        workspaceId: ctx.workspaceId,
-        keptBusinessId: keptId,
-        mergedBusinessId: mergedId,
-        snapshot: snapshot as unknown as Record<string, unknown>,
-        actorId: ctx.user.id,
-      })
-      .returning({ id: mergeHistory.id });
-
-    await tx.insert(activities).values({
+    const historyId = newId();
+    const history: MergeHistoryDoc = {
+      _id: historyId,
       workspaceId: ctx.workspaceId,
-      businessId: keptId,
-      type: "merged",
-      message: `Merged duplicate “${merged.name}” into this lead`,
+      keptBusinessId: keptId,
+      mergedBusinessId: mergedId,
+      snapshot: snapshot as unknown as Record<string, unknown>,
       actorId: ctx.user.id,
-      metadata: { mergedBusinessId: mergedId },
-    });
+      createdAt: timestamp,
+      undoneAt: null,
+    };
+    await collections.mergeHistory.insertOne(history, opt);
 
-    if (!history) throw new Error("Could not write merge history.");
-    return history.id;
+    await collections.activities.insertOne(
+      {
+        _id: newId(),
+        workspaceId: ctx.workspaceId,
+        businessId: keptId,
+        type: "merged",
+        message: `Merged duplicate “${merged.name}” into this lead`,
+        metadata: { mergedBusinessId: mergedId },
+        actorId: ctx.user.id,
+        createdAt: timestamp,
+      },
+      opt,
+    );
+
+    return historyId;
   });
 
   await recalculateLeadScore(ctx.workspaceId, keptId);
@@ -444,208 +440,234 @@ export async function mergeBusinesses(
   return { keptId, mergedId, mergeId };
 }
 
-function toDate(value: unknown): Date | null {
-  if (typeof value !== "string") return null;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
-}
-
 export async function undoLastMerge(ctx: ActorContext): Promise<{ mergeId: string } | null> {
-  const [history] = await db
-    .select()
-    .from(mergeHistory)
-    .where(and(eq(mergeHistory.workspaceId, ctx.workspaceId), isNull(mergeHistory.undoneAt)))
-    .orderBy(desc(mergeHistory.createdAt))
-    .limit(1);
+  const history = await collections.mergeHistory.findOne(
+    { workspaceId: ctx.workspaceId, undoneAt: null },
+    { sort: { createdAt: -1 } },
+  );
   if (!history) return null;
 
   const snapshot = history.snapshot as unknown as MergeSnapshot;
+  const mergedId = history.mergedBusinessId;
+  const keptId = history.keptBusinessId;
 
-  await db.transaction(async (tx) => {
-    const mergedId = history.mergedBusinessId;
-    const keptId = history.keptBusinessId;
-    const business = snapshot.business as Record<string, unknown>;
+  await withTransaction(async (session) => {
+    const opt = { session };
+    const business = snapshot.business;
 
-    await tx
-      .update(businesses)
-      .set({
-        mergedIntoId: null,
-        archivedAt: null,
-        name: String(business.name ?? ""),
-        normalizedName: String(business.normalizedName ?? ""),
-        category: (business.category as string | null) ?? null,
-        categoryKey: (business.categoryKey as string | null) ?? null,
-        phone: (business.phone as string | null) ?? null,
-        phoneE164: (business.phoneE164 as string | null) ?? null,
-        email: (business.email as string | null) ?? null,
-        emailNormalized: (business.emailNormalized as string | null) ?? null,
-        websiteUrl: (business.websiteUrl as string | null) ?? null,
-        websiteHost: (business.websiteHost as string | null) ?? null,
-        street: (business.street as string | null) ?? null,
-        area: (business.area as string | null) ?? null,
-        city: (business.city as string | null) ?? null,
-        country: (business.country as string | null) ?? null,
-        lat: (business.lat as number | null) ?? null,
-        lng: (business.lng as number | null) ?? null,
-        status: business.status as typeof businesses.$inferInsert.status,
-        notes: (business.notes as string | null) ?? null,
-        followUpAt: toDate(business.followUpAt),
-        ownerId: (business.ownerId as string | null) ?? null,
-        doNotContact: Boolean(business.doNotContact),
-        updatedAt: new Date(),
-      })
-      .where(and(eq(businesses.workspaceId, ctx.workspaceId), eq(businesses.id, mergedId)));
+    await collections.businesses.updateOne(
+      { workspaceId: ctx.workspaceId, _id: mergedId },
+      {
+        $set: {
+          mergedIntoId: null,
+          archivedAt: null,
+          name: String(business.name ?? ""),
+          normalizedName: String(business.normalizedName ?? ""),
+          category: (business.category as string | null) ?? null,
+          categoryKey: (business.categoryKey as string | null) ?? null,
+          phone: (business.phone as string | null) ?? null,
+          phoneE164: (business.phoneE164 as string | null) ?? null,
+          email: (business.email as string | null) ?? null,
+          emailNormalized: (business.emailNormalized as string | null) ?? null,
+          websiteUrl: (business.websiteUrl as string | null) ?? null,
+          websiteHost: (business.websiteHost as string | null) ?? null,
+          street: (business.street as string | null) ?? null,
+          area: (business.area as string | null) ?? null,
+          city: (business.city as string | null) ?? null,
+          country: (business.country as string | null) ?? null,
+          lat: (business.lat as number | null) ?? null,
+          lng: (business.lng as number | null) ?? null,
+          status: business.status as BusinessDoc["status"],
+          notes: (business.notes as string | null) ?? null,
+          followUpAt: toDate(business.followUpAt),
+          ownerId: (business.ownerId as string | null) ?? null,
+          doNotContact: Boolean(business.doNotContact),
+          updatedAt: now(),
+        },
+      },
+      opt,
+    );
 
     if (snapshot.resolvedCandidateIds?.length) {
-      await tx
-        .update(duplicateCandidates)
-        .set({ status: "pending", resolvedAt: null, resolvedBy: null })
-        .where(
-          and(
-            eq(duplicateCandidates.workspaceId, ctx.workspaceId),
-            inArray(duplicateCandidates.id, snapshot.resolvedCandidateIds),
-          ),
-        );
+      await collections.duplicateCandidates.updateMany(
+        {
+          workspaceId: ctx.workspaceId,
+          _id: { $in: snapshot.resolvedCandidateIds },
+        },
+        { $set: { status: "pending", resolvedAt: null, resolvedBy: null } },
+        opt,
+      );
     }
 
     for (const raw of snapshot.merged.contacts) {
       const contact = raw as Record<string, unknown>;
-      await tx
-        .insert(contactPoints)
-        .values({
-          id: contact.id as string,
-          workspaceId: ctx.workspaceId,
-          businessId: mergedId,
-          type: contact.type as typeof contactPoints.$inferInsert.type,
-          value: String(contact.value),
-          normalizedValue: String(contact.normalizedValue),
-          label: (contact.label as string | null) ?? null,
-          platform: (contact.platform as string | null) ?? null,
-          verifiedByUser: Boolean(contact.verifiedByUser),
-          confidence: contact.confidence as typeof contactPoints.$inferInsert.confidence,
-          firstSeenAt: toDate(contact.firstSeenAt) ?? new Date(),
-          lastSeenAt: toDate(contact.lastSeenAt) ?? new Date(),
-        })
-        .onConflictDoNothing();
+      const doc: ContactPointDoc = {
+        _id: String(contact._id),
+        workspaceId: ctx.workspaceId,
+        businessId: mergedId,
+        type: contact.type as ContactPointDoc["type"],
+        value: String(contact.value),
+        normalizedValue: String(contact.normalizedValue),
+        label: (contact.label as string | null) ?? null,
+        platform: (contact.platform as string | null) ?? null,
+        verifiedByUser: Boolean(contact.verifiedByUser),
+        confidence: contact.confidence as ContactPointDoc["confidence"],
+        firstSeenAt: toDate(contact.firstSeenAt) ?? now(),
+        lastSeenAt: toDate(contact.lastSeenAt) ?? now(),
+        createdAt: toDate(contact.createdAt) ?? now(),
+      };
+      await collections.contactPoints.replaceOne(
+        { _id: doc._id },
+        doc,
+        { ...opt, upsert: true },
+      );
     }
+
     for (const raw of snapshot.merged.evidence) {
       const evidence = raw as Record<string, unknown>;
-      await tx
-        .insert(evidenceRecords)
-        .values({
-          id: evidence.id as string,
-          workspaceId: ctx.workspaceId,
-          businessId: mergedId,
-          type: String(evidence.type),
-          originalValue: String(evidence.originalValue),
-          normalizedValue: (evidence.normalizedValue as string | null) ?? null,
-          sourceUrl: String(evidence.sourceUrl),
-          method: String(evidence.method),
-          confidence: evidence.confidence as typeof evidenceRecords.$inferInsert.confidence,
-          verificationStatus: String(evidence.verificationStatus ?? "unverified"),
-          firstSeenAt: toDate(evidence.firstSeenAt) ?? new Date(),
-          lastSeenAt: toDate(evidence.lastSeenAt) ?? new Date(),
-        })
-        .onConflictDoNothing();
+      const doc: EvidenceRecordDoc = {
+        _id: String(evidence._id),
+        workspaceId: ctx.workspaceId,
+        businessId: mergedId,
+        contactPointId: (evidence.contactPointId as string | null) ?? null,
+        scanResultId: (evidence.scanResultId as string | null) ?? null,
+        type: String(evidence.type),
+        originalValue: String(evidence.originalValue),
+        normalizedValue: (evidence.normalizedValue as string | null) ?? null,
+        sourceUrl: String(evidence.sourceUrl),
+        method: String(evidence.method),
+        confidence: evidence.confidence as EvidenceRecordDoc["confidence"],
+        verificationStatus: String(evidence.verificationStatus ?? "unverified"),
+        firstSeenAt: toDate(evidence.firstSeenAt) ?? now(),
+        lastSeenAt: toDate(evidence.lastSeenAt) ?? now(),
+      };
+      await collections.evidenceRecords.replaceOne(
+        { _id: doc._id },
+        doc,
+        { ...opt, upsert: true },
+      );
     }
+
     for (const raw of snapshot.merged.sources) {
       const source = raw as Record<string, unknown>;
-      await tx
-        .insert(sourceRecords)
-        .values({
-          id: source.id as string,
-          workspaceId: ctx.workspaceId,
-          businessId: mergedId,
-          source: source.source as typeof sourceRecords.$inferInsert.source,
-          sourceId: String(source.sourceId),
-          payload: (source.payload as Record<string, unknown> | null) ?? null,
-          attribution: (source.attribution as string | null) ?? null,
-          importJobId: (source.importJobId as string | null) ?? null,
-        })
-        .onConflictDoNothing();
+      const doc: SourceRecordDoc = {
+        _id: String(source._id),
+        workspaceId: ctx.workspaceId,
+        businessId: mergedId,
+        source: source.source as SourceRecordDoc["source"],
+        sourceId: String(source.sourceId),
+        payload: (source.payload as Record<string, unknown> | null) ?? null,
+        attribution: (source.attribution as string | null) ?? null,
+        importJobId: (source.importJobId as string | null) ?? null,
+        createdAt: toDate(source.createdAt) ?? now(),
+      };
+      await collections.sourceRecords.replaceOne(
+        { _id: doc._id },
+        doc,
+        { ...opt, upsert: true },
+      );
     }
 
     // Remove records that were copied onto the kept lead during the merge.
     const keptContactIds = new Set(snapshot.keptBefore.contactIds);
-    const currentContacts = await tx
-      .select({ id: contactPoints.id })
-      .from(contactPoints)
-      .where(and(eq(contactPoints.workspaceId, ctx.workspaceId), eq(contactPoints.businessId, keptId)));
+    const currentContacts = await collections.contactPoints
+      .find(
+        { workspaceId: ctx.workspaceId, businessId: keptId },
+        { ...opt, projection: { _id: 1 } },
+      )
+      .toArray();
     for (const contact of currentContacts) {
-      if (!keptContactIds.has(contact.id)) {
-        await tx.delete(contactPoints).where(eq(contactPoints.id, contact.id));
+      if (!keptContactIds.has(contact._id)) {
+        await collections.contactPoints.deleteOne({ _id: contact._id }, opt);
       }
     }
+
     const keptEvidenceIds = new Set(snapshot.keptBefore.evidenceIds);
-    const currentEvidence = await tx
-      .select({ id: evidenceRecords.id })
-      .from(evidenceRecords)
-      .where(and(eq(evidenceRecords.workspaceId, ctx.workspaceId), eq(evidenceRecords.businessId, keptId)));
+    const currentEvidence = await collections.evidenceRecords
+      .find(
+        { workspaceId: ctx.workspaceId, businessId: keptId },
+        { ...opt, projection: { _id: 1 } },
+      )
+      .toArray();
     for (const evidence of currentEvidence) {
-      if (!keptEvidenceIds.has(evidence.id)) {
-        await tx.delete(evidenceRecords).where(eq(evidenceRecords.id, evidence.id));
+      if (!keptEvidenceIds.has(evidence._id)) {
+        await collections.evidenceRecords.deleteOne({ _id: evidence._id }, opt);
       }
     }
 
     if (snapshot.merged.noteIds.length) {
-      await tx
-        .update(notes)
-        .set({ businessId: mergedId })
-        .where(and(eq(notes.workspaceId, ctx.workspaceId), inArray(notes.id, snapshot.merged.noteIds)));
+      await collections.notes.updateMany(
+        { workspaceId: ctx.workspaceId, _id: { $in: snapshot.merged.noteIds } },
+        { $set: { businessId: mergedId } },
+        opt,
+      );
     }
     if (snapshot.merged.activityIds.length) {
-      await tx
-        .update(activities)
-        .set({ businessId: mergedId })
-        .where(
-          and(
-            eq(activities.workspaceId, ctx.workspaceId),
-            inArray(activities.id, snapshot.merged.activityIds),
-          ),
-        );
+      await collections.activities.updateMany(
+        { workspaceId: ctx.workspaceId, _id: { $in: snapshot.merged.activityIds } },
+        { $set: { businessId: mergedId } },
+        opt,
+      );
     }
 
     const keptTagIds = new Set(snapshot.keptBefore.tagIds);
-    await tx
-      .delete(businessTags)
-      .where(
-        and(
-          eq(businessTags.workspaceId, ctx.workspaceId),
-          eq(businessTags.businessId, keptId),
-          snapshot.merged.tagIds.length ? inArray(businessTags.tagId, snapshot.merged.tagIds) : undefined,
-          keptTagIds.size ? notInArray(businessTags.tagId, [...keptTagIds]) : undefined,
-        ),
-      );
     if (snapshot.merged.tagIds.length) {
-      await tx
-        .insert(businessTags)
-        .values(
-          snapshot.merged.tagIds.map((tagId) => ({ workspaceId: ctx.workspaceId, businessId: mergedId, tagId })),
-        )
-        .onConflictDoNothing();
+      const removeIds = snapshot.merged.tagIds
+        .filter((tagId) => !keptTagIds.has(tagId))
+        .map((tagId) => `${keptId}:${tagId}`);
+      if (removeIds.length) {
+        await collections.businessTags.deleteMany({ _id: { $in: removeIds } }, opt);
+      }
+      for (const tagId of snapshot.merged.tagIds) {
+        const id = `${mergedId}:${tagId}`;
+        await collections.businessTags.updateOne(
+          { _id: id },
+          { $setOnInsert: { _id: id, workspaceId: ctx.workspaceId, businessId: mergedId, tagId } },
+          { ...opt, upsert: true },
+        );
+      }
     }
 
     if (snapshot.filledFields.length) {
       const updates: Record<string, unknown> = {};
       for (const field of snapshot.filledFields) updates[field] = null;
-      await tx
-        .update(businesses)
-        .set(updates)
-        .where(and(eq(businesses.workspaceId, ctx.workspaceId), eq(businesses.id, keptId)));
+      await collections.businesses.updateOne(
+        { workspaceId: ctx.workspaceId, _id: keptId },
+        { $set: updates },
+        opt,
+      );
     }
 
-    await tx
-      .update(mergeHistory)
-      .set({ undoneAt: new Date() })
-      .where(eq(mergeHistory.id, history.id));
+    // Recompute the denormalized WhatsApp flag for both leads.
+    for (const businessId of [keptId, mergedId]) {
+      const whatsapp = await collections.contactPoints.countDocuments(
+        { workspaceId: ctx.workspaceId, businessId, type: "whatsapp" },
+        opt,
+      );
+      await collections.businesses.updateOne(
+        { workspaceId: ctx.workspaceId, _id: businessId },
+        { $set: { hasWhatsapp: whatsapp > 0 } },
+        opt,
+      );
+    }
 
-    await tx.insert(activities).values({
+    await collections.mergeHistory.updateOne(
+      { _id: history._id },
+      { $set: { undoneAt: now() } },
+      opt,
+    );
+
+    const activity: ActivityDoc = {
+      _id: newId(),
       workspaceId: ctx.workspaceId,
       businessId: keptId,
       type: "merged",
       message: "Merge undone",
+      metadata: null,
       actorId: ctx.user.id,
-    });
+      createdAt: now(),
+    };
+    await collections.activities.insertOne(activity, opt);
   });
 
   await recalculateLeadScore(ctx.workspaceId, history.keptBusinessId);
@@ -653,7 +675,7 @@ export async function undoLastMerge(ctx: ActorContext): Promise<{ mergeId: strin
     businessId: history.keptBusinessId,
     action: "unmerged",
   });
-  return { mergeId: history.id };
+  return { mergeId: history._id };
 }
 
 export interface DuplicatePair {
@@ -678,81 +700,47 @@ export interface DuplicatePair {
 }
 
 export async function listDuplicatePairs(ctx: ActorContext): Promise<DuplicatePair[]> {
-  const a = alias(businesses, "a");
-  const b = alias(businesses, "b");
-  const rows = await db
-    .select({
-      id: duplicateCandidates.id,
-      similarity: duplicateCandidates.similarity,
-      distanceM: duplicateCandidates.distanceM,
-      reasons: duplicateCandidates.reasons,
-      status: duplicateCandidates.status,
-      aId: a.id,
-      aName: a.name,
-      aCategory: a.category,
-      aCity: a.city,
-      aPhone: a.phone,
-      aEmail: a.email,
-      aHost: a.websiteHost,
-      aStreet: a.street,
-      aScore: a.latestScore,
-      aStatus: a.status,
-      bId: b.id,
-      bName: b.name,
-      bCategory: b.category,
-      bCity: b.city,
-      bPhone: b.phone,
-      bEmail: b.email,
-      bHost: b.websiteHost,
-      bStreet: b.street,
-      bScore: b.latestScore,
-      bStatus: b.status,
-    })
-    .from(duplicateCandidates)
-    .innerJoin(a, eq(a.id, duplicateCandidates.businessAId))
-    .innerJoin(b, eq(b.id, duplicateCandidates.businessBId))
-    .where(
-      and(
-        eq(duplicateCandidates.workspaceId, ctx.workspaceId),
-        eq(duplicateCandidates.status, "pending"),
-        isNull(a.mergedIntoId),
-        isNull(b.mergedIntoId),
-      ),
-    )
-    .orderBy(desc(duplicateCandidates.similarity))
-    .limit(100);
+  const candidates = await collections.duplicateCandidates
+    .find({ workspaceId: ctx.workspaceId, status: "pending" })
+    .sort({ similarity: -1 })
+    .limit(400)
+    .toArray();
 
-  return rows.map((row) => ({
-    id: row.id,
-    similarity: Math.round(row.similarity * 100) / 100,
-    distanceM: row.distanceM,
-    reasons: row.reasons,
-    status: row.status,
-    a: {
-      id: row.aId,
-      name: row.aName,
-      category: row.aCategory,
-      city: row.aCity,
-      phone: row.aPhone,
-      email: row.aEmail,
-      websiteHost: row.aHost,
-      street: row.aStreet,
-      latestScore: row.aScore,
-      status: row.aStatus,
-    },
-    b: {
-      id: row.bId,
-      name: row.bName,
-      category: row.bCategory,
-      city: row.bCity,
-      phone: row.bPhone,
-      email: row.bEmail,
-      websiteHost: row.bHost,
-      street: row.bStreet,
-      latestScore: row.bScore,
-      status: row.bStatus,
-    },
-  }));
+  const ids = [...new Set(candidates.flatMap((row) => [row.businessAId, row.businessBId]))];
+  const businesses = ids.length
+    ? await collections.businesses.find({ _id: { $in: ids } }).toArray()
+    : [];
+  const byId = new Map(businesses.map((business) => [business._id, business]));
+
+  const pairs: DuplicatePair[] = [];
+  for (const candidate of candidates) {
+    const a = byId.get(candidate.businessAId);
+    const b = byId.get(candidate.businessBId);
+    if (!a || !b || a.mergedIntoId || b.mergedIntoId) continue;
+    const view = (business: BusinessDoc): DuplicatePair["a"] => ({
+      id: business._id,
+      name: business.name,
+      category: business.category,
+      city: business.city,
+      phone: business.phone,
+      email: business.email,
+      websiteHost: business.websiteHost,
+      street: business.street,
+      latestScore: business.latestScore,
+      status: business.status,
+    });
+    pairs.push({
+      id: candidate._id,
+      similarity: Math.round(candidate.similarity * 100) / 100,
+      distanceM: candidate.distanceM,
+      reasons: candidate.reasons,
+      status: candidate.status,
+      a: view(a),
+      b: view(b),
+    });
+    if (pairs.length >= 100) break;
+  }
+  return pairs;
 }
 
 export async function resolveDuplicate(
@@ -761,11 +749,10 @@ export async function resolveDuplicate(
   action: "merge" | "keep_separate" | "skip",
   keep: "a" | "b" = "a",
 ): Promise<void> {
-  const [pair] = await db
-    .select()
-    .from(duplicateCandidates)
-    .where(and(eq(duplicateCandidates.workspaceId, ctx.workspaceId), eq(duplicateCandidates.id, id)))
-    .limit(1);
+  const pair = await collections.duplicateCandidates.findOne({
+    workspaceId: ctx.workspaceId,
+    _id: id,
+  });
   if (!pair) throw notFound("Duplicate candidate not found");
   if (pair.status !== "pending") throw conflict("This duplicate has already been resolved.");
 
@@ -773,19 +760,21 @@ export async function resolveDuplicate(
     const keptId = keep === "b" ? pair.businessBId : pair.businessAId;
     const mergedId = keep === "b" ? pair.businessAId : pair.businessBId;
     await mergeBusinesses(ctx, keptId, mergedId);
-    await db
-      .update(duplicateCandidates)
-      .set({ status: "merged", resolvedAt: new Date(), resolvedBy: ctx.user.id })
-      .where(eq(duplicateCandidates.id, id));
+    await collections.duplicateCandidates.updateOne(
+      { _id: id },
+      { $set: { status: "merged", resolvedAt: now(), resolvedBy: ctx.user.id } },
+    );
   } else {
-    await db
-      .update(duplicateCandidates)
-      .set({
-        status: action === "skip" ? "skipped" : "kept_separate",
-        resolvedAt: new Date(),
-        resolvedBy: ctx.user.id,
-      })
-      .where(eq(duplicateCandidates.id, id));
+    await collections.duplicateCandidates.updateOne(
+      { _id: id },
+      {
+        $set: {
+          status: action === "skip" ? "skipped" : "kept_separate",
+          resolvedAt: now(),
+          resolvedBy: ctx.user.id,
+        },
+      },
+    );
     await publishEvent(ctx.workspaceId, "duplicates.resolved", { action });
   }
 }

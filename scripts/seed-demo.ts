@@ -1,42 +1,39 @@
 import "dotenv/config";
-import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
 import { hashPassword } from "better-auth/crypto";
-import { db, pool } from "@/lib/db";
-import {
-  account,
-  activities,
-  businessTags,
-  businesses,
-  contactPoints,
-  duplicateCandidates,
-  evidenceRecords,
-  importJobs,
-  memberships,
-  notes,
-  savedSearches,
-  savedViews,
-  scanJobs,
-  scanResults,
-  scoreProfiles,
-  scoreResults,
-  sourceRecords,
-  tags,
-  user,
-  workspaces,
-} from "@/lib/db/schema";
+import { closeMongo, collections, newId, now } from "@/lib/db";
+import { ensureIndexes } from "@/lib/db/indexes";
+import type {
+  AccountDoc,
+  ActivityDoc,
+  BusinessDoc,
+  BusinessLocationDoc,
+  BusinessTagDoc,
+  ContactPointDoc,
+  DuplicateCandidateDoc,
+  EvidenceRecordDoc,
+  ImportJobDoc,
+  MembershipDoc,
+  NoteDoc,
+  SavedSearchDoc,
+  SavedViewDoc,
+  ScanJobDoc,
+  ScanResultDoc,
+  ScoreProfileDoc,
+  ScoreResultDoc,
+  SourceRecordDoc,
+  TagDoc,
+  UserDoc,
+  WorkspaceDoc,
+} from "@/lib/db/types";
 import { PROFILE_NAME } from "@/lib/score/service";
 import { cloneDefaultConfig } from "@/lib/score/config";
 import { computeScore } from "@/lib/score/engine";
-import { normalizeBusiness } from "@/lib/normalize";
+import { nameTokens, normalizeBusiness } from "@/lib/normalize";
 import type { PipelineStatus } from "@/lib/constants";
-import type { Database } from "@/lib/db";
 
 export const DEMO_EMAIL = "demo@leadfinder.example";
 export const DEMO_PASSWORD = process.env.DEMO_PASSWORD ?? "demo-password-123";
 export const DEMO_WORKSPACE_SLUG = "demo-fictional";
-
-type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 interface DemoContactSeed {
   type: "email" | "phone" | "whatsapp" | "contact_form" | "social";
@@ -314,129 +311,206 @@ function daysAgo(days: number): Date {
   return new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 }
 
+/** Every collection that carries workspace-scoped demo data. */
+const DEMO_SCOPED_COLLECTIONS = [
+  collections.businesses,
+  collections.businessLocations,
+  collections.sourceRecords,
+  collections.contactPoints,
+  collections.importJobs,
+  collections.importRowErrors,
+  collections.scanJobs,
+  collections.scanResults,
+  collections.evidenceRecords,
+  collections.scoreProfiles,
+  collections.scoreResults,
+  collections.notes,
+  collections.tags,
+  collections.businessTags,
+  collections.activities,
+  collections.duplicateCandidates,
+  collections.mergeHistory,
+  collections.savedViews,
+  collections.categoryMappings,
+  collections.exportJobs,
+  collections.savedSearches,
+] as const;
+
 async function ensureDemoUser(): Promise<string> {
-  const [existing] = await db.select().from(user).where(eq(user.email, DEMO_EMAIL)).limit(1);
+  const existing = await collections.user.findOne({ email: DEMO_EMAIL });
   const password = await hashPassword(DEMO_PASSWORD);
+  const timestamp = now();
 
   if (existing) {
-    await db.update(user).set({ name: "Demo Owner", emailVerified: true }).where(eq(user.id, existing.id));
-    const [credential] = await db
-      .select()
-      .from(account)
-      .where(and(eq(account.userId, existing.id), eq(account.providerId, "credential")))
-      .limit(1);
+    await collections.user.updateOne(
+      { _id: existing._id },
+      { $set: { name: "Demo Owner", emailVerified: true, updatedAt: timestamp } },
+    );
+    const credential = await collections.account.findOne({
+      userId: existing._id,
+      providerId: "credential",
+    });
     if (credential) {
-      await db.update(account).set({ password }).where(eq(account.id, credential.id));
+      await collections.account.updateOne(
+        { _id: credential._id },
+        { $set: { password, updatedAt: timestamp } },
+      );
     } else {
-      await db.insert(account).values({
-        id: randomUUID(),
-        accountId: existing.id,
+      const account: AccountDoc = {
+        _id: newId(),
+        accountId: existing._id,
         providerId: "credential",
-        userId: existing.id,
+        userId: existing._id,
+        accessToken: null,
+        refreshToken: null,
+        idToken: null,
+        accessTokenExpiresAt: null,
+        refreshTokenExpiresAt: null,
+        scope: null,
         password,
-      });
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      await collections.account.insertOne(account);
     }
-    return existing.id;
+    return existing._id;
   }
 
-  const userId = randomUUID();
-  await db.insert(user).values({
-    id: userId,
+  const userId = newId();
+  const user: UserDoc = {
+    _id: userId,
     name: "Demo Owner",
     email: DEMO_EMAIL,
     emailVerified: true,
-  });
-  await db.insert(account).values({
-    id: randomUUID(),
+    image: null,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  await collections.user.insertOne(user);
+  const account: AccountDoc = {
+    _id: newId(),
     accountId: userId,
     providerId: "credential",
     userId,
+    accessToken: null,
+    refreshToken: null,
+    idToken: null,
+    accessTokenExpiresAt: null,
+    refreshTokenExpiresAt: null,
+    scope: null,
     password,
-  });
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  await collections.account.insertOne(account);
   return userId;
 }
 
-async function seedWithin(tx: Transaction, userId: string): Promise<{ workspaceId: string; leadCount: number }> {
-  const [workspace] = await tx
-    .insert(workspaces)
-    .values({
-      name: "Demo (fictional)",
-      slug: DEMO_WORKSPACE_SLUG,
-      isDemo: true,
-      timezone: "UTC",
-      countryNotes: {},
-    })
-    .returning({ id: workspaces.id });
-  if (!workspace) throw new Error("Could not create the demo workspace.");
+interface SeedResult {
+  workspaceId: string;
+  leadCount: number;
+}
 
-  await tx.insert(memberships).values({
-    workspaceId: workspace.id,
+async function seedWorkspace(userId: string): Promise<SeedResult> {
+  const workspace: WorkspaceDoc = {
+    _id: newId(),
+    name: "Demo (fictional)",
+    slug: DEMO_WORKSPACE_SLUG,
+    isDemo: true,
+    timezone: "UTC",
+    countryNotes: {},
+    createdAt: daysAgo(10),
+    updatedAt: daysAgo(1),
+  };
+  await collections.workspaces.insertOne(workspace);
+  const workspaceId = workspace._id;
+
+  const membership: MembershipDoc = {
+    _id: newId(),
+    workspaceId,
     userId,
     role: "owner",
-  });
+    createdAt: workspace.createdAt,
+  };
+  await collections.memberships.insertOne(membership);
 
-  // Created inline (rather than via ensureDefaultProfile) because that helper
-  // uses the shared client, which cannot see rows from this open transaction.
-  const [profile] = await tx
-    .insert(scoreProfiles)
-    .values({
-      workspaceId: workspace.id,
-      name: PROFILE_NAME,
-      version: 1,
-      isActive: true,
-      config: cloneDefaultConfig(),
-      createdBy: userId,
-    })
-    .returning();
-  if (!profile) throw new Error("Could not create the demo score profile.");
+  const profile: ScoreProfileDoc = {
+    _id: newId(),
+    workspaceId,
+    name: PROFILE_NAME,
+    version: 1,
+    isActive: true,
+    config: cloneDefaultConfig(),
+    createdAt: workspace.createdAt,
+    createdBy: userId,
+  };
+  await collections.scoreProfiles.insertOne(profile);
 
-  const [importJob] = await tx
-    .insert(importJobs)
-    .values({
-      workspaceId: workspace.id,
-      createdBy: userId,
-      origin: "import",
-      filename: "demo-fictional-businesses.csv",
-      fileHash: "demo-fictional-file-hash",
-      mappingHash: "demo-fictional-mapping-hash",
-      idempotencyKey: "demo-import-v1",
-      storagePath: null,
-      mapping: {
-        name: "Business Name",
-        category: "Category",
-        website: "Website",
-        phone: "Phone",
-        email: "Email",
-        street: "Street",
-        city: "City",
-      },
-      detectedColumns: ["Business Name", "Category", "Website", "Phone", "Email", "Street", "City"],
-      status: "completed",
-      progress: 100,
-      processedRows: DEMO_LEADS.length,
-      rowCount: DEMO_LEADS.length,
-      validCount: DEMO_LEADS.length,
-      newCount: DEMO_LEADS.length - 1,
-      duplicateCount: 1,
-      reviewCount: 1,
-      mappingConfirmed: true,
-      startedAt: daysAgo(9),
-      finishedAt: daysAgo(9),
-    })
-    .returning({ id: importJobs.id });
+  const importJob: ImportJobDoc = {
+    _id: newId(),
+    workspaceId,
+    createdBy: userId,
+    origin: "import",
+    filename: "demo-fictional-businesses.csv",
+    fileHash: "demo-fictional-file-hash",
+    mappingHash: "demo-fictional-mapping-hash",
+    idempotencyKey: "demo-import-v1",
+    storagePath: null,
+    mapping: {
+      name: "Business Name",
+      category: "Category",
+      website: "Website",
+      phone: "Phone",
+      email: "Email",
+      street: "Street",
+      city: "City",
+    },
+    detectedColumns: ["Business Name", "Category", "Website", "Phone", "Email", "Street", "City"],
+    status: "completed",
+    progress: 100,
+    processedRows: DEMO_LEADS.length,
+    rowCount: DEMO_LEADS.length,
+    validCount: DEMO_LEADS.length,
+    newCount: DEMO_LEADS.length - 1,
+    duplicateCount: 1,
+    mergedCount: 0,
+    reviewCount: 1,
+    skippedCount: 0,
+    errorCount: 0,
+    mappingConfirmed: true,
+    error: null,
+    createdAt: daysAgo(9),
+    startedAt: daysAgo(9),
+    finishedAt: daysAgo(9),
+  };
+  await collections.importJobs.insertOne(importJob);
 
-  const tagNames: Array<{ name: string; color: string }> = [
+  const tagDefs: Array<{ name: string; color: string }> = [
     { name: "High priority", color: "warning" },
     { name: "Warm", color: "success" },
     { name: "Needs follow-up", color: "primary" },
   ];
-  const tagRows = await tx
-    .insert(tags)
-    .values(tagNames.map((tag) => ({ ...tag, workspaceId: workspace.id })))
-    .returning({ id: tags.id, name: tags.name });
-  const tagByName = new Map(tagRows.map((tag) => [tag.name, tag.id]));
+  const tagDocs: TagDoc[] = tagDefs.map((tag) => ({
+    _id: newId(),
+    workspaceId,
+    name: tag.name,
+    color: tag.color,
+    createdAt: workspace.createdAt,
+  }));
+  await collections.tags.insertMany(tagDocs);
+  const tagByName = new Map(tagDocs.map((tag) => [tag.name, tag._id]));
 
-  const leadIds: string[] = [];
+  const businesses: BusinessDoc[] = [];
+  const locations: BusinessLocationDoc[] = [];
+  const sources: SourceRecordDoc[] = [];
+  const contacts: ContactPointDoc[] = [];
+  const evidence: EvidenceRecordDoc[] = [];
+  const scoreResults: ScoreResultDoc[] = [];
+  const scanJobs: ScanJobDoc[] = [];
+  const scanResults: ScanResultDoc[] = [];
+  const activities: ActivityDoc[] = [];
+  const notes: NoteDoc[] = [];
+  const businessTags: BusinessTagDoc[] = [];
   const leadIdBySource = new Map<string, string>();
 
   for (const [index, lead] of DEMO_LEADS.entries()) {
@@ -453,7 +527,7 @@ async function seedWithin(tx: Transaction, userId: string): Promise<{ workspaceI
       lng: lead.lng,
       sourceId: lead.sourceId,
     });
-    const contacts = contactsFor(lead);
+    const leadContacts = contactsFor(lead);
     const score = computeScore(
       {
         categoryKey: normalized.categoryKey,
@@ -465,7 +539,7 @@ async function seedWithin(tx: Transaction, userId: string): Promise<{ workspaceI
               summary: null,
             }
           : null,
-        contacts: contacts.map((contact) => ({
+        contacts: leadContacts.map((contact) => ({
           type: contact.type,
           normalizedValue: contact.normalized,
         })),
@@ -474,216 +548,229 @@ async function seedWithin(tx: Transaction, userId: string): Promise<{ workspaceI
         hasInquiryForm: Boolean(lead.hasInquiryForm),
       },
       profile.config,
-      { profileId: profile.id, profileVersion: profile.version },
+      { profileId: profile._id, profileVersion: profile.version },
     );
 
-    const [business] = await tx
-      .insert(businesses)
-      .values({
-        workspaceId: workspace.id,
-        name: normalized.name,
-        normalizedName: normalized.normalizedName,
-        category: normalized.category,
-        categoryKey: normalized.categoryKey,
-        phone: normalized.phone?.raw ?? lead.phone ?? null,
-        phoneE164: normalized.phone?.e164 ?? null,
-        email: normalized.emailDisplay,
-        emailNormalized: normalized.email,
-        websiteUrl: normalized.website?.url ?? null,
-        websiteHost: normalized.website?.host ?? null,
-        street: normalized.street,
-        area: normalized.area,
-        city: normalized.city,
-        country: normalized.country,
-        lat: normalized.lat,
-        lng: normalized.lng,
-        status: lead.status,
-        ownerId: userId,
-        doNotContact: lead.status === "do_not_contact",
-        followUpAt: lead.followUpDays !== undefined ? daysFromNow(lead.followUpDays) : null,
-        notes: lead.notes ?? null,
-        fieldLocks: [],
-        isDemo: true,
-        latestScore: score.total,
-        lastCheckedAt: lead.scan ? daysAgo(index + 1) : null,
-        createdAt: daysAgo(10 - index),
-        updatedAt: daysAgo(index),
-      })
-      .returning({ id: businesses.id });
-    if (!business) throw new Error(`Could not create demo lead ${lead.name}.`);
-    leadIds.push(business.id);
-    leadIdBySource.set(lead.sourceId, business.id);
+    const businessId = newId();
+    leadIdBySource.set(lead.sourceId, businessId);
+    const scoreResultId = newId();
+    const scanJobId = lead.scan ? newId() : null;
+    const scanResultId = lead.scan ? newId() : null;
+    const createdAt = daysAgo(10 - index);
+    const checkedAt = lead.scan ? daysAgo(index + 1) : null;
 
-    await tx.insert(sourceRecords).values({
-      workspaceId: workspace.id,
-      businessId: business.id,
+    businesses.push({
+      _id: businessId,
+      workspaceId,
+      name: normalized.name,
+      normalizedName: normalized.normalizedName,
+      nameTokens: nameTokens(normalized.normalizedName),
+      category: normalized.category,
+      categoryKey: normalized.categoryKey,
+      phone: normalized.phone?.raw ?? lead.phone ?? null,
+      phoneE164: normalized.phone?.e164 ?? null,
+      email: normalized.emailDisplay,
+      emailNormalized: normalized.email,
+      websiteUrl: normalized.website?.url ?? null,
+      websiteHost: normalized.website?.host ?? null,
+      street: normalized.street,
+      area: normalized.area,
+      city: normalized.city,
+      country: normalized.country,
+      lat: normalized.lat,
+      lng: normalized.lng,
+      status: lead.status,
+      ownerId: userId,
+      doNotContact: lead.status === "do_not_contact",
+      followUpAt: lead.followUpDays !== undefined ? daysFromNow(lead.followUpDays) : null,
+      notes: lead.notes ?? null,
+      fieldLocks: [],
+      latestScore: score.total,
+      latestScoreResultId: scoreResultId,
+      latestScanId: scanResultId,
+      latestScanOutcome: lead.scan?.outcome ?? null,
+      latestChatbotResult: lead.scan?.chatbot ?? null,
+      lastCheckedAt: checkedAt,
+      isDemo: true,
+      hasWhatsapp: Boolean(lead.whatsapp),
+      mergedIntoId: null,
+      archivedAt: null,
+      createdAt,
+      updatedAt: daysAgo(index),
+    });
+
+    locations.push({
+      _id: newId(),
+      workspaceId,
+      businessId,
+      street: normalized.street,
+      area: normalized.area,
+      city: normalized.city,
+      country: normalized.country,
+      lat: normalized.lat,
+      lng: normalized.lng,
+      formattedAddress: null,
+      isPrimary: true,
+      createdAt,
+    });
+
+    sources.push({
+      _id: newId(),
+      workspaceId,
+      businessId,
       source: "demo",
       sourceId: lead.sourceId,
       payload: { fictional: true, name: lead.name },
       attribution: "Demo data (fictional) — not a real business",
-      importJobId: importJob?.id ?? null,
+      importJobId: importJob._id,
+      createdAt,
     });
 
-    const contactRows = contacts.length
-      ? await tx
-          .insert(contactPoints)
-          .values(
-            contacts.map((contact) => ({
-              workspaceId: workspace.id,
-              businessId: business.id,
-              type: contact.type,
-              value: contact.value,
-              normalizedValue: contact.normalized,
-              label: contact.label ?? null,
-              platform: contact.platform ?? null,
-              confidence: "medium" as const,
-            })),
-          )
-          .returning({ id: contactPoints.id, type: contactPoints.type, value: contactPoints.value })
-      : [];
+    const contactDocs: ContactPointDoc[] = leadContacts.map((contact) => ({
+      _id: newId(),
+      workspaceId,
+      businessId,
+      type: contact.type,
+      value: contact.value,
+      normalizedValue: contact.normalized,
+      label: contact.label ?? null,
+      platform: contact.platform ?? null,
+      verifiedByUser: false,
+      confidence: "medium",
+      firstSeenAt: createdAt,
+      lastSeenAt: checkedAt ?? createdAt,
+      createdAt,
+    }));
+    contacts.push(...contactDocs);
 
-    if (contactRows.length) {
-      const sourceUrl = lead.website ?? "https://demo.leadfinder.example/source";
-      await tx.insert(evidenceRecords).values(
-        contactRows.map((contact) => ({
-          workspaceId: workspace.id,
-          businessId: business.id,
-          contactPointId: contact.id,
-          type: contact.type,
-          originalValue: contact.value,
-          normalizedValue: contacts.find((entry) => entry.value === contact.value)?.normalized ?? null,
-          sourceUrl,
-          method: lead.scan ? "website_scan" : "import",
-          confidence: "medium" as const,
-          verificationStatus: "unverified",
-        })),
-      );
+    const sourceUrl = lead.website ?? "https://demo.leadfinder.example/source";
+    for (const contact of contactDocs) {
+      evidence.push({
+        _id: newId(),
+        workspaceId,
+        businessId,
+        contactPointId: contact._id,
+        scanResultId,
+        type: contact.type,
+        originalValue: contact.value,
+        normalizedValue: contact.normalizedValue,
+        sourceUrl,
+        method: lead.scan ? "website_scan" : "import",
+        confidence: "medium",
+        verificationStatus: "unverified",
+        firstSeenAt: createdAt,
+        lastSeenAt: checkedAt ?? createdAt,
+      });
     }
 
-    const [scoreRow] = await tx
-      .insert(scoreResults)
-      .values({
-        workspaceId: workspace.id,
-        businessId: business.id,
-        profileId: profile.id,
-        profileVersion: profile.version,
-        total: score.total,
-        components: score.components,
-        calculatedAt: daysAgo(index),
-      })
-      .returning({ id: scoreResults.id });
+    scoreResults.push({
+      _id: scoreResultId,
+      workspaceId,
+      businessId,
+      profileId: profile._id,
+      profileVersion: profile.version,
+      total: score.total,
+      components: score.components,
+      calculatedAt: daysAgo(index),
+    });
 
-    let scanResultId: string | null = null;
     if (lead.scan) {
-      const [scanJob] = await tx
-        .insert(scanJobs)
-        .values({
-          workspaceId: workspace.id,
-          businessId: business.id,
-          requestedBy: userId,
-          status: "completed",
-          outcome: lead.scan.outcome,
-          progress: 100,
-          pagesTotal: lead.scan.pages ?? 1,
-          pagesDone: lead.scan.pages ?? 1,
-          force: false,
-          createdAt: daysAgo(index + 1),
-          startedAt: daysAgo(index + 1),
-          finishedAt: daysAgo(index + 1),
-        })
-        .returning({ id: scanJobs.id });
+      const pages = lead.scan.pages ?? 1;
+      scanJobs.push({
+        _id: scanJobId!,
+        workspaceId,
+        businessId,
+        requestedBy: userId,
+        status: "completed",
+        outcome: lead.scan.outcome,
+        progress: 100,
+        pagesTotal: pages,
+        pagesDone: pages,
+        force: false,
+        cancelRequested: false,
+        error: null,
+        createdAt: daysAgo(index + 1),
+        startedAt: daysAgo(index + 1),
+        finishedAt: daysAgo(index + 1),
+      });
 
-      const [scanRow] = await tx
-        .insert(scanResults)
-        .values({
-          workspaceId: workspace.id,
-          businessId: business.id,
-          jobId: scanJob?.id ?? null,
-          outcome: lead.scan.outcome,
-          chatbotResult: lead.scan.chatbot,
-          chatWidgets: lead.scan.widgets ?? [],
-          platform: lead.scan.platform ?? null,
-          platformConfidence: lead.scan.platform ? "medium" : null,
-          title: lead.scan.title ?? null,
-          lang: "en",
-          httpStatus: 200,
-          finalUrl: lead.website ?? null,
-          pagesScanned: lead.scan.outcome === "success" ? (lead.scan.pages ?? 1) : 1,
-          pagesSkipped: lead.scan.outcome === "partial" ? Math.max(0, (lead.scan.pages ?? 1) - 1) : 0,
-          confidence: lead.scan.confidence ?? "medium",
-          pageDetails: [
-            {
-              url: lead.website ?? null,
-              outcome: lead.scan.outcome === "success" ? "success" : "partial",
-              status: 200,
-            },
-          ],
-          summary: {
-            note:
-              lead.scan.outcome === "success"
-                ? "Demo scan result. Pages were checked for contact details and chat widgets."
-                : "Demo scan stopped after the home page; remaining points were withheld.",
+      scanResults.push({
+        _id: scanResultId!,
+        workspaceId,
+        businessId,
+        jobId: scanJobId,
+        outcome: lead.scan.outcome,
+        chatbotResult: lead.scan.chatbot,
+        chatWidgets: lead.scan.widgets ?? [],
+        platform: lead.scan.platform ?? null,
+        platformConfidence: lead.scan.platform ? "medium" : null,
+        title: lead.scan.title ?? null,
+        lang: "en",
+        httpStatus: 200,
+        finalUrl: lead.website ?? null,
+        pagesScanned: lead.scan.outcome === "success" ? pages : 1,
+        pagesSkipped: lead.scan.outcome === "partial" ? Math.max(0, pages - 1) : 0,
+        confidence: lead.scan.confidence ?? "medium",
+        pageDetails: [
+          {
+            url: lead.website ?? null,
+            outcome: lead.scan.outcome === "success" ? "success" : "partial",
+            status: 200,
           },
-          durationMs: 1200 + index * 130,
-          createdAt: daysAgo(index + 1),
-        })
-        .returning({ id: scanResults.id });
-      scanResultId = scanRow?.id ?? null;
+        ],
+        summary: {
+          note:
+            lead.scan.outcome === "success"
+              ? "Demo scan result. Pages were checked for contact details and chat widgets."
+              : "Demo scan stopped after the home page; remaining points were withheld.",
+        },
+        durationMs: 1200 + index * 130,
+        createdAt: daysAgo(index + 1),
+      });
 
-      await tx
-        .update(businesses)
-        .set({
-          latestScore: score.total,
-          latestScoreResultId: scoreRow?.id ?? null,
-          latestScanId: scanResultId,
-          latestScanOutcome: lead.scan.outcome,
-          latestChatbotResult: lead.scan.chatbot,
-          lastCheckedAt: daysAgo(index + 1),
-        })
-        .where(and(eq(businesses.workspaceId, workspace.id), eq(businesses.id, business.id)));
-
-      await tx.insert(activities).values({
-        workspaceId: workspace.id,
-        businessId: business.id,
+      activities.push({
+        _id: newId(),
+        workspaceId,
+        businessId,
         type: "scan_completed",
         message:
           lead.scan.outcome === "success"
-            ? `Website check completed (${lead.scan.pages ?? 1} pages).`
+            ? `Website check completed (${pages} pages).`
             : "Website check partially completed; scan-dependent points were withheld.",
         metadata: { outcome: lead.scan.outcome, chatbot: lead.scan.chatbot },
         actorId: userId,
         createdAt: daysAgo(index + 1),
       });
-    } else {
-      await tx
-        .update(businesses)
-        .set({ latestScoreResultId: scoreRow?.id ?? null })
-        .where(and(eq(businesses.workspaceId, workspace.id), eq(businesses.id, business.id)));
     }
 
-    await tx.insert(activities).values([
+    activities.push(
       {
-        workspaceId: workspace.id,
-        businessId: business.id,
+        _id: newId(),
+        workspaceId,
+        businessId,
         type: "imported",
         message: "Imported from demo-fictional-businesses.csv",
+        metadata: { importJobId: importJob._id },
         actorId: userId,
         createdAt: daysAgo(9),
       },
       {
-        workspaceId: workspace.id,
-        businessId: business.id,
+        _id: newId(),
+        workspaceId,
+        businessId,
         type: "status_changed",
         message: `Status set to ${lead.status.replaceAll("_", " ")}.`,
+        metadata: { status: lead.status },
         actorId: userId,
         createdAt: daysAgo(index),
       },
-    ]);
+    );
 
     if (lead.notes) {
-      await tx.insert(notes).values({
-        workspaceId: workspace.id,
-        businessId: business.id,
+      notes.push({
+        _id: newId(),
+        workspaceId,
+        businessId,
         body: lead.notes,
         authorId: userId,
         createdAt: daysAgo(index),
@@ -694,20 +781,39 @@ async function seedWithin(tx: Transaction, userId: string): Promise<{ workspaceI
     for (const tagName of lead.tags ?? []) {
       const tagId = tagByName.get(tagName);
       if (tagId) {
-        await tx.insert(businessTags).values({
-          workspaceId: workspace.id,
-          businessId: business.id,
+        businessTags.push({
+          _id: `${businessId}:${tagId}`,
+          workspaceId,
+          businessId,
           tagId,
         });
       }
     }
   }
 
+  await Promise.all([
+    collections.businesses.insertMany(businesses),
+    collections.businessLocations.insertMany(locations),
+    collections.sourceRecords.insertMany(sources),
+    collections.contactPoints.insertMany(contacts),
+    collections.scoreResults.insertMany(scoreResults),
+  ]);
+
+  const optionalWrites: Array<Promise<unknown>> = [];
+  if (evidence.length) optionalWrites.push(collections.evidenceRecords.insertMany(evidence));
+  if (scanJobs.length) optionalWrites.push(collections.scanJobs.insertMany(scanJobs));
+  if (scanResults.length) optionalWrites.push(collections.scanResults.insertMany(scanResults));
+  if (activities.length) optionalWrites.push(collections.activities.insertMany(activities));
+  if (notes.length) optionalWrites.push(collections.notes.insertMany(notes));
+  if (businessTags.length) optionalWrites.push(collections.businessTags.insertMany(businessTags));
+  await Promise.all(optionalWrites);
+
   const primaryId = leadIdBySource.get("demo-001");
   const duplicateId = leadIdBySource.get("demo-002");
   if (primaryId && duplicateId) {
-    await tx.insert(duplicateCandidates).values({
-      workspaceId: workspace.id,
+    const duplicate: DuplicateCandidateDoc = {
+      _id: newId(),
+      workspaceId,
       businessAId: primaryId,
       businessBId: duplicateId,
       similarity: 0.94,
@@ -718,56 +824,75 @@ async function seedWithin(tx: Transaction, userId: string): Promise<{ workspaceI
         "Same street address",
       ],
       status: "pending",
-    });
+      createdAt: daysAgo(8),
+      resolvedAt: null,
+      resolvedBy: null,
+    };
+    await collections.duplicateCandidates.insertOne(duplicate);
   }
 
-  const demoViewQuery: Record<string, string> = {
-    minScore: "70",
-    sort: "score_desc",
-    includeArchived: "false",
-  };
-  await tx.insert(savedViews).values({
-    workspaceId: workspace.id,
+  const savedView: SavedViewDoc = {
+    _id: newId(),
+    workspaceId,
     userId,
     name: "High-score leads",
-    query: demoViewQuery,
-  });
-
-  await tx.insert(savedSearches).values({
-    workspaceId: workspace.id,
+    query: {
+      minScore: "70",
+      sort: "score_desc",
+      includeArchived: "false",
+    },
+    createdAt: workspace.createdAt,
+  };
+  const savedSearch: SavedSearchDoc = {
+    _id: newId(),
+    workspaceId,
     provider: "osm",
     country: "United Arab Emirates",
     city: "Dubai",
     categories: ["dentist", "salon"],
     limitCount: 50,
     enabled: false,
-  });
-
-  await tx.insert(activities).values({
-    workspaceId: workspace.id,
+    lastRunAt: null,
+    createdAt: workspace.createdAt,
+  };
+  const workspaceActivity: ActivityDoc = {
+    _id: newId(),
+    workspaceId,
     businessId: null,
     type: "imported",
     message: `Demo import completed with ${DEMO_LEADS.length} fictional businesses.`,
+    metadata: { importJobId: importJob._id },
     actorId: userId,
     createdAt: daysAgo(9),
-  });
+  };
+  await Promise.all([
+    collections.savedViews.insertOne(savedView),
+    collections.savedSearches.insertOne(savedSearch),
+    collections.activities.insertOne(workspaceActivity),
+  ]);
 
-  return { workspaceId: workspace.id, leadCount: leadIds.length };
+  return { workspaceId, leadCount: businesses.length };
 }
 
 async function main(): Promise<void> {
+  await ensureIndexes();
   const userId = await ensureDemoUser();
 
-  const [existing] = await db
-    .select({ id: workspaces.id })
-    .from(workspaces)
-    .where(and(eq(workspaces.slug, DEMO_WORKSPACE_SLUG), eq(workspaces.isDemo, true)))
-    .limit(1);
+  const existing = await collections.workspaces.findOne({
+    slug: DEMO_WORKSPACE_SLUG,
+    isDemo: true,
+  });
   if (existing) {
-    await db.delete(workspaces).where(eq(workspaces.id, existing.id));
+    await Promise.all(
+      DEMO_SCOPED_COLLECTIONS.map((collection) =>
+        collection.deleteMany({ workspaceId: existing._id }),
+      ),
+    );
+    await collections.memberships.deleteMany({ workspaceId: existing._id });
+    await collections.workspaces.deleteOne({ _id: existing._id });
   }
 
-  const result = await db.transaction((tx) => seedWithin(tx, userId));
+  const result = await seedWorkspace(userId);
 
   console.log(
     [
@@ -788,5 +913,5 @@ main()
     process.exitCode = 1;
   })
   .finally(async () => {
-    await pool.end();
+    await closeMongo();
   });

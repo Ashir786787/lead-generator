@@ -1,13 +1,5 @@
-import { and, desc, eq, gte, isNull } from "drizzle-orm";
-import { db } from "@/lib/db";
-import {
-  activities,
-  businesses,
-  contactPoints,
-  evidenceRecords,
-  scanJobs,
-  scanResults,
-} from "@/lib/db/schema";
+import { collections, newId, now } from "@/lib/db";
+import type { BusinessDoc, ScanResultDoc } from "@/lib/db/types";
 import { fetchPage } from "./fetch";
 import { extractPage, type PageExtraction } from "./extract";
 import { normalizeWebsite } from "@/lib/normalize/website";
@@ -115,34 +107,34 @@ export async function processScan(
   force: boolean,
 ): Promise<{ outcome: ScanOutcome }> {
   const started = Date.now();
-  const [job] = await db
-    .select()
-    .from(scanJobs)
-    .where(and(eq(scanJobs.workspaceId, workspaceId), eq(scanJobs.id, scanJobId)))
-    .limit(1);
+  const job = await collections.scanJobs.findOne({
+    workspaceId,
+    _id: scanJobId,
+  });
   if (!job) return { outcome: "error" };
   if (job.status === "cancelled") {
-    await db
-      .update(scanJobs)
-      .set({ cancelRequested: true })
-      .where(and(eq(scanJobs.workspaceId, workspaceId), eq(scanJobs.id, scanJobId)));
+    await collections.scanJobs.updateOne(
+      { workspaceId, _id: scanJobId },
+      { $set: { cancelRequested: true } },
+    );
     return { outcome: "cancelled" };
   }
 
-  const [business] = await db
-    .select({
-      id: businesses.id,
-      name: businesses.name,
-      websiteUrl: businesses.websiteUrl,
-      country: businesses.country,
-      email: businesses.email,
-      phoneE164: businesses.phoneE164,
-      ownerId: businesses.ownerId,
-      mergedIntoId: businesses.mergedIntoId,
-    })
-    .from(businesses)
-    .where(and(eq(businesses.workspaceId, workspaceId), eq(businesses.id, businessId)))
-    .limit(1);
+  const business = await collections.businesses.findOne(
+    { workspaceId, _id: businessId },
+    {
+      projection: {
+        _id: 1,
+        name: 1,
+        websiteUrl: 1,
+        country: 1,
+        email: 1,
+        phoneE164: 1,
+        ownerId: 1,
+        mergedIntoId: 1,
+      },
+    },
+  );
   if (!business) {
     await failJob(workspaceId, scanJobId, "The lead no longer exists.");
     return { outcome: "error" };
@@ -153,32 +145,31 @@ export async function processScan(
   }
 
   if (!force) {
-    const [cached] = await db
-      .select()
-      .from(scanResults)
-      .where(
-        and(
-          eq(scanResults.workspaceId, workspaceId),
-          eq(scanResults.businessId, businessId),
-          eq(scanResults.outcome, "success"),
-          gte(scanResults.createdAt, scanCacheCutoff()),
-        ),
-      )
-      .orderBy(desc(scanResults.createdAt))
-      .limit(1);
+    const cached = await collections.scanResults.findOne(
+      {
+        workspaceId,
+        businessId,
+        outcome: "success",
+        createdAt: { $gte: scanCacheCutoff() },
+      },
+      { sort: { createdAt: -1 } },
+    );
     if (cached) {
-      await db
-        .update(scanJobs)
-        .set({
-          status: "completed",
-          outcome: cached.outcome,
-          progress: 100,
-          pagesTotal: cached.pagesScanned,
-          pagesDone: cached.pagesScanned,
-          startedAt: new Date(),
-          finishedAt: new Date(),
-        })
-        .where(and(eq(scanJobs.workspaceId, workspaceId), eq(scanJobs.id, scanJobId)));
+      const timestamp = now();
+      await collections.scanJobs.updateOne(
+        { workspaceId, _id: scanJobId },
+        {
+          $set: {
+            status: "completed",
+            outcome: cached.outcome,
+            progress: 100,
+            pagesTotal: cached.pagesScanned,
+            pagesDone: cached.pagesScanned,
+            startedAt: timestamp,
+            finishedAt: timestamp,
+          },
+        },
+      );
       await publishEvent(workspaceId, "scan.completed", {
         businessId,
         scanJobId,
@@ -189,10 +180,10 @@ export async function processScan(
     }
   }
 
-  await db
-    .update(scanJobs)
-    .set({ status: "processing", startedAt: new Date(), progress: 2, pagesTotal: 1 })
-    .where(and(eq(scanJobs.workspaceId, workspaceId), eq(scanJobs.id, scanJobId)));
+  await collections.scanJobs.updateOne(
+    { workspaceId, _id: scanJobId },
+    { $set: { status: "processing", startedAt: now(), progress: 2, pagesTotal: 1 } },
+  );
 
   try {
     const homepageFetch = await fetchPage(business.websiteUrl);
@@ -227,10 +218,10 @@ export async function processScan(
     });
     const extraPages = choosePages(homepageFetch.finalUrl, homepage);
     const pagesTotal = 1 + extraPages.length;
-    await db
-      .update(scanJobs)
-      .set({ pagesTotal, pagesDone, progress: Math.floor((pagesDone / pagesTotal) * 100) })
-      .where(and(eq(scanJobs.workspaceId, workspaceId), eq(scanJobs.id, scanJobId)));
+    await collections.scanJobs.updateOne(
+      { workspaceId, _id: scanJobId },
+      { $set: { pagesTotal, pagesDone, progress: Math.floor((pagesDone / pagesTotal) * 100) } },
+    );
     await publishEvent(workspaceId, "scan.progress", {
       businessId,
       scanJobId,
@@ -241,16 +232,15 @@ export async function processScan(
     const extraExtractions: PageExtraction[] = [];
     let pageFailures = 0;
     for (const pageUrl of extraPages) {
-      const [state] = await db
-        .select({ cancelRequested: scanJobs.cancelRequested })
-        .from(scanJobs)
-        .where(and(eq(scanJobs.workspaceId, workspaceId), eq(scanJobs.id, scanJobId)))
-        .limit(1);
+      const state = await collections.scanJobs.findOne(
+        { workspaceId, _id: scanJobId },
+        { projection: { _id: 1, cancelRequested: 1 } },
+      );
       if (state?.cancelRequested) {
-        await db
-          .update(scanJobs)
-          .set({ status: "cancelled", outcome: "cancelled", finishedAt: new Date() })
-          .where(and(eq(scanJobs.workspaceId, workspaceId), eq(scanJobs.id, scanJobId)));
+        await collections.scanJobs.updateOne(
+          { workspaceId, _id: scanJobId },
+          { $set: { status: "cancelled", outcome: "cancelled", finishedAt: now() } },
+        );
         await publishEvent(workspaceId, "job.cancelled", { businessId, scanJobId });
         return { outcome: "cancelled" };
       }
@@ -281,10 +271,10 @@ export async function processScan(
           durationMs: page.durationMs,
         });
       }
-      await db
-        .update(scanJobs)
-        .set({ pagesDone, progress: Math.min(95, Math.floor((pagesDone / pagesTotal) * 100)) })
-        .where(and(eq(scanJobs.workspaceId, workspaceId), eq(scanJobs.id, scanJobId)));
+      await collections.scanJobs.updateOne(
+        { workspaceId, _id: scanJobId },
+        { $set: { pagesDone, progress: Math.min(95, Math.floor((pagesDone / pagesTotal) * 100)) } },
+      );
       await publishEvent(workspaceId, "scan.progress", {
         businessId,
         scanJobId,
@@ -305,19 +295,22 @@ export async function processScan(
       started,
     });
 
-    await db
-      .update(scanJobs)
-      .set({
-        status: "completed",
-        outcome,
-        progress: 100,
-        pagesTotal,
-        pagesDone,
-        finishedAt: new Date(),
-      })
-      .where(and(eq(scanJobs.workspaceId, workspaceId), eq(scanJobs.id, scanJobId)));
+    await collections.scanJobs.updateOne(
+      { workspaceId, _id: scanJobId },
+      {
+        $set: {
+          status: "completed",
+          outcome,
+          progress: 100,
+          pagesTotal,
+          pagesDone,
+          finishedAt: now(),
+        },
+      },
+    );
 
-    await db.insert(activities).values({
+    await collections.activities.insertOne({
+      _id: newId(),
       workspaceId,
       businessId,
       type: "scan_completed",
@@ -327,6 +320,7 @@ export async function processScan(
           : "Website check incomplete",
       metadata: { scanJobId, outcome, pages: pageDetails.length, chatbotResult: result.chatbotResult },
       actorId: job.requestedBy,
+      createdAt: now(),
     });
 
     await publishEvent(workspaceId, "scan.completed", {
@@ -353,48 +347,57 @@ async function finishFailure(
   pages: PageDetail[],
   started: number,
 ): Promise<void> {
-  const [inserted] = await db
-    .insert(scanResults)
-    .values({
-      workspaceId,
-      businessId,
-      jobId: scanJobId,
-      outcome,
-      chatbotResult: "unknown",
-      chatWidgets: [],
-      pagesScanned: 0,
-      pagesSkipped: pages.length,
-      confidence: "low",
-      pageDetails: pages,
-      summary: { pages },
-      durationMs: Date.now() - started,
-      finalUrl: pages[0]?.url ?? null,
-      httpStatus: pages[0]?.httpStatus ?? null,
-    })
-    .returning({ id: scanResults.id });
+  const timestamp = now();
+  const result: ScanResultDoc = {
+    _id: newId(),
+    workspaceId,
+    businessId,
+    jobId: scanJobId,
+    outcome,
+    chatbotResult: "unknown",
+    chatWidgets: [],
+    platform: null,
+    platformConfidence: null,
+    title: null,
+    lang: null,
+    httpStatus: pages[0]?.httpStatus ?? null,
+    finalUrl: pages[0]?.url ?? null,
+    pagesScanned: 0,
+    pagesSkipped: pages.length,
+    confidence: "low",
+    pageDetails: pages,
+    summary: { pages },
+    durationMs: Date.now() - started,
+    createdAt: timestamp,
+  };
+  await collections.scanResults.insertOne(result);
 
-  await db
-    .update(businesses)
-    .set({
-      latestScanId: inserted?.id ?? null,
-      latestScanOutcome: outcome,
-      latestChatbotResult: "unknown",
-      lastCheckedAt: new Date(),
-      updatedAt: new Date(),
-    })
-    .where(and(eq(businesses.workspaceId, workspaceId), eq(businesses.id, businessId)));
+  await collections.businesses.updateOne(
+    { workspaceId, _id: businessId },
+    {
+      $set: {
+        latestScanId: result._id,
+        latestScanOutcome: outcome,
+        latestChatbotResult: "unknown",
+        lastCheckedAt: timestamp,
+        updatedAt: timestamp,
+      },
+    },
+  );
 
-  await db
-    .update(scanJobs)
-    .set({
-      status: "completed",
-      outcome,
-      progress: 100,
-      pagesTotal: pages.length,
-      pagesDone: pages.length,
-      finishedAt: new Date(),
-    })
-    .where(and(eq(scanJobs.workspaceId, workspaceId), eq(scanJobs.id, scanJobId)));
+  await collections.scanJobs.updateOne(
+    { workspaceId, _id: scanJobId },
+    {
+      $set: {
+        status: "completed",
+        outcome,
+        progress: 100,
+        pagesTotal: pages.length,
+        pagesDone: pages.length,
+        finishedAt: timestamp,
+      },
+    },
+  );
 
   await recalculateLeadScore(workspaceId, businessId);
   await publishEvent(workspaceId, "scan.failed", {
@@ -407,14 +410,7 @@ async function finishFailure(
 
 interface PersistOptions {
   workspaceId: string;
-  business: {
-    id: string;
-    name: string;
-    country: string | null;
-    email: string | null;
-    phoneE164: string | null;
-    ownerId: string | null;
-  };
+  business: Pick<BusinessDoc, "_id" | "name" | "country" | "email" | "phoneE164" | "ownerId">;
   scanJobId: string;
   outcome: ScanOutcome;
   extractions: PageExtraction[];
@@ -462,54 +458,51 @@ async function persistScanResult(options: PersistOptions): Promise<{
   const confidence: "high" | "medium" | "low" =
     outcome === "success" ? (pageDetails.filter((page) => page.outcome === "success").length >= 2 ? "high" : "medium") : "low";
 
-  const [inserted] = await db
-    .insert(scanResults)
-    .values({
-      workspaceId,
-      businessId: business.id,
-      jobId: scanJobId,
-      outcome,
-      chatbotResult,
-      chatWidgets,
-      platform: platformEntry?.[0] ?? null,
-      platformConfidence: platformEntry ? (platformEntry[1] > 1 ? "high" : "medium") : null,
-      title: homepage?.title ?? null,
-      lang: homepage?.lang ?? null,
-      httpStatus: pageDetails[0]?.httpStatus ?? null,
-      finalUrl: homepage?.url ?? null,
-      pagesScanned: pageDetails.filter((page) => page.outcome === "success").length,
-      pagesSkipped: pageDetails.filter((page) => page.outcome !== "success").length,
-      confidence,
-      pageDetails,
-      summary: summary as unknown as Record<string, unknown>,
-      durationMs: Date.now() - options.started,
-    })
-    .returning({ id: scanResults.id });
-  if (!inserted) throw new Error("Could not save the scan result.");
+  const timestamp = now();
+  const result: ScanResultDoc = {
+    _id: newId(),
+    workspaceId,
+    businessId: business._id,
+    jobId: scanJobId,
+    outcome,
+    chatbotResult,
+    chatWidgets,
+    platform: platformEntry?.[0] ?? null,
+    platformConfidence: platformEntry ? (platformEntry[1] > 1 ? "high" : "medium") : null,
+    title: homepage?.title ?? null,
+    lang: homepage?.lang ?? null,
+    httpStatus: pageDetails[0]?.httpStatus ?? null,
+    finalUrl: homepage?.url ?? null,
+    pagesScanned: pageDetails.filter((page) => page.outcome === "success").length,
+    pagesSkipped: pageDetails.filter((page) => page.outcome !== "success").length,
+    confidence,
+    pageDetails,
+    summary: summary as unknown as Record<string, unknown>,
+    durationMs: Date.now() - options.started,
+    createdAt: timestamp,
+  };
+  await collections.scanResults.insertOne(result);
 
-  await persistContacts(options, chatWidgets, inserted.id);
+  await persistContacts(options, chatWidgets, result._id);
 
-  await db
-    .update(businesses)
-    .set({
-      latestScanId: inserted.id,
-      latestScanOutcome: outcome,
-      latestChatbotResult: chatbotResult,
-      lastCheckedAt: new Date(),
-      updatedAt: new Date(),
-      ...(business.email ? {} : emailForBusiness(summary)),
-      ...(business.phoneE164 ? {} : phoneForBusiness(summary)),
-    })
-    .where(
-      and(
-        eq(businesses.workspaceId, workspaceId),
-        eq(businesses.id, business.id),
-        isNull(businesses.mergedIntoId),
-      ),
-    );
+  const updates: Partial<BusinessDoc> = {
+    latestScanId: result._id,
+    latestScanOutcome: outcome,
+    latestChatbotResult: chatbotResult,
+    lastCheckedAt: timestamp,
+    updatedAt: timestamp,
+    ...(business.email ? {} : emailForBusiness(summary)),
+    ...(business.phoneE164 ? {} : phoneForBusiness(summary)),
+  };
+  if (summary.whatsapps.length) updates.hasWhatsapp = true;
 
-  await recalculateLeadScore(workspaceId, business.id);
-  return { id: inserted.id, chatbotResult };
+  await collections.businesses.updateOne(
+    { workspaceId, _id: business._id, mergedIntoId: null },
+    { $set: updates },
+  );
+
+  await recalculateLeadScore(workspaceId, business._id);
+  return { id: result._id, chatbotResult };
 }
 
 function emailForBusiness(summary: ScanSummary): { email?: string; emailNormalized?: string } {
@@ -652,68 +645,95 @@ async function persistContacts(
     }
   }
 
-  const now = new Date();
+  const timestamp = now();
   for (const candidate of candidates.values()) {
-    const [contact] = await db
-      .insert(contactPoints)
-      .values({
+    const value = candidate.value.slice(0, 2000);
+    const normalizedValue = candidate.normalizedValue.slice(0, 2000);
+    const existing = await collections.contactPoints.findOne({
+      businessId: business._id,
+      type: candidate.type,
+      normalizedValue,
+    });
+
+    let contactId: string;
+    if (existing) {
+      contactId = existing._id;
+      await collections.contactPoints.updateOne(
+        { _id: existing._id },
+        {
+          $set: {
+            lastSeenAt: timestamp,
+            label: candidate.label,
+            platform: candidate.platform,
+          },
+        },
+      );
+    } else {
+      contactId = newId();
+      await collections.contactPoints.insertOne({
+        _id: contactId,
         workspaceId,
-        businessId: business.id,
+        businessId: business._id,
         type: candidate.type,
-        value: candidate.value.slice(0, 2000),
-        normalizedValue: candidate.normalizedValue.slice(0, 2000),
+        value,
+        normalizedValue,
         label: candidate.label,
         platform: candidate.platform,
+        verifiedByUser: false,
         confidence: candidate.confidence,
-        firstSeenAt: now,
-        lastSeenAt: now,
-      })
-      .onConflictDoUpdate({
-        target: [contactPoints.businessId, contactPoints.type, contactPoints.normalizedValue],
-        set: {
-          lastSeenAt: now,
-          label: candidate.label,
-          platform: candidate.platform,
-        },
-      })
-      .returning({ id: contactPoints.id });
+        firstSeenAt: timestamp,
+        lastSeenAt: timestamp,
+        createdAt: timestamp,
+      });
+    }
 
-    if (candidate.evidence.length) {
-      await db
-        .insert(evidenceRecords)
-        .values(
-          candidate.evidence.slice(0, 8).map((evidence) => ({
+    for (const evidence of candidate.evidence.slice(0, 8)) {
+      const originalValue = evidence.originalValue.slice(0, 1000);
+      const sourceUrl = evidence.sourceUrl.slice(0, 2000);
+      await collections.evidenceRecords.updateOne(
+        {
+          businessId: business._id,
+          type: candidate.type,
+          originalValue,
+          sourceUrl,
+        },
+        {
+          $setOnInsert: {
+            _id: newId(),
             workspaceId,
-            businessId: business.id,
-            contactPointId: contact?.id ?? null,
+            businessId: business._id,
+            contactPointId: contactId,
             scanResultId,
             type: candidate.type,
-            originalValue: evidence.originalValue.slice(0, 1000),
+            originalValue,
             normalizedValue: candidate.normalizedValue.slice(0, 1000),
-            sourceUrl: evidence.sourceUrl.slice(0, 2000),
+            sourceUrl,
             method: evidence.method,
             confidence: evidence.confidence,
             verificationStatus: "unverified",
-            firstSeenAt: now,
-            lastSeenAt: now,
-          })),
-        )
-        .onConflictDoNothing();
+            firstSeenAt: timestamp,
+            lastSeenAt: timestamp,
+          },
+        },
+        { upsert: true },
+      );
     }
   }
 }
 
 async function failJob(workspaceId: string, scanJobId: string, message: string): Promise<void> {
-  await db
-    .update(scanJobs)
-    .set({
-      status: "failed",
-      outcome: "error",
-      error: message.slice(0, 2000),
-      progress: 100,
-      finishedAt: new Date(),
-    })
-    .where(and(eq(scanJobs.workspaceId, workspaceId), eq(scanJobs.id, scanJobId)));
+  await collections.scanJobs.updateOne(
+    { workspaceId, _id: scanJobId },
+    {
+      $set: {
+        status: "failed",
+        outcome: "error",
+        error: message.slice(0, 2000),
+        progress: 100,
+        finishedAt: now(),
+      },
+    },
+  );
   await publishEvent(workspaceId, "scan.failed", { scanJobId, message });
 }
 

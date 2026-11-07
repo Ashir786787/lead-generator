@@ -1,6 +1,5 @@
-import { and, desc, eq } from "drizzle-orm";
-import { db } from "@/lib/db";
-import { importJobs, savedSearches } from "@/lib/db/schema";
+import { collections, newId, now } from "@/lib/db";
+import type { ImportJobDoc, SavedSearchDoc } from "@/lib/db/types";
 import type { WorkspaceContext } from "@/lib/auth/session";
 import { conflict, notFound } from "@/lib/api/errors";
 import { env } from "@/lib/env";
@@ -592,22 +591,36 @@ export async function runDiscovery(
   }
 
   const filename = `Discovery — ${request.city} (${request.provider === "osm" ? "OpenStreetMap" : "Google Places"})`;
-  const [job] = await db
-    .insert(importJobs)
-    .values({
-      workspaceId: ctx.workspaceId,
-      createdBy: ctx.user.id,
-      origin: "discovery",
-      filename: filename.slice(0, 240),
-      fileHash: hashText(JSON.stringify(request)),
-      mapping: DISCOVERY_MAPPING,
-      detectedColumns: Object.keys(records[0] ?? {}),
-      mappingConfirmed: true,
-      status: "queued",
-      rowCount: records.length,
-    })
-    .returning({ id: importJobs.id });
-  if (!job) throw new Error("Could not create the discovery import.");
+  const job: ImportJobDoc = {
+    _id: newId(),
+    workspaceId: ctx.workspaceId,
+    createdBy: ctx.user.id,
+    origin: "discovery",
+    filename: filename.slice(0, 240),
+    fileHash: hashText(JSON.stringify(request)),
+    mappingHash: null,
+    idempotencyKey: null,
+    storagePath: null,
+    mapping: DISCOVERY_MAPPING,
+    detectedColumns: Object.keys(records[0] ?? {}),
+    status: "queued",
+    progress: 0,
+    processedRows: 0,
+    rowCount: records.length,
+    validCount: 0,
+    newCount: 0,
+    duplicateCount: 0,
+    mergedCount: 0,
+    reviewCount: 0,
+    skippedCount: 0,
+    errorCount: 0,
+    mappingConfirmed: true,
+    error: null,
+    createdAt: now(),
+    startedAt: null,
+    finishedAt: null,
+  };
+  await collections.importJobs.insertOne(job);
 
   async function* generate() {
     for (let index = 0; index < records.length; index++) {
@@ -620,7 +633,7 @@ export async function runDiscovery(
   try {
     const counts = await ingestRecords({
       actor: { workspaceId: ctx.workspaceId, userId: ctx.user.id, isDemo: ctx.isDemo },
-      jobId: job.id,
+      jobId: job._id,
       source: request.provider === "osm" ? "osm" : "google_places",
       sourceLabel: filename,
       mapping: DISCOVERY_MAPPING,
@@ -628,25 +641,27 @@ export async function runDiscovery(
       records: generate(),
       totalHint: records.length,
       onProgress: async (_counts, processed) => {
-        await db
-          .update(importJobs)
-          .set({
-            processedRows: processed,
-            progress: Math.min(99, Math.round((processed / records.length) * 100)),
-          })
-          .where(and(eq(importJobs.workspaceId, ctx.workspaceId), eq(importJobs.id, job.id)));
+        await collections.importJobs.updateOne(
+          { workspaceId: ctx.workspaceId, _id: job._id },
+          {
+            $set: {
+              processedRows: processed,
+              progress: Math.min(99, Math.round((processed / records.length) * 100)),
+            },
+          },
+        );
       },
     });
     await finalizeImportJob(
       { workspaceId: ctx.workspaceId, userId: ctx.user.id, isDemo: ctx.isDemo },
-      job.id,
+      job._id,
       counts,
     );
     return {
       provider: request.provider,
       via: outcome.via,
       found: records.length,
-      importJobId: job.id,
+      importJobId: job._id,
       counts,
       sample: records.slice(0, 12).map((record) => ({
         name: String(record.name ?? ""),
@@ -666,15 +681,17 @@ export async function runDiscovery(
     };
   } catch (error) {
     logger.error({ err: error, provider: request.provider }, "Discovery import failed");
-    await db
-      .update(importJobs)
-      .set({
-        status: "failed",
-        progress: 100,
-        error: error instanceof Error ? error.message.slice(0, 2000) : "Discovery ingest failed.",
-        finishedAt: new Date(),
-      })
-      .where(and(eq(importJobs.workspaceId, ctx.workspaceId), eq(importJobs.id, job.id)));
+    await collections.importJobs.updateOne(
+      { workspaceId: ctx.workspaceId, _id: job._id },
+      {
+        $set: {
+          status: "failed",
+          progress: 100,
+          error: error instanceof Error ? error.message.slice(0, 2000) : "Discovery ingest failed.",
+          finishedAt: now(),
+        },
+      },
+    );
     throw error;
   }
 }
@@ -692,13 +709,12 @@ export interface SavedSearch {
 }
 
 export async function listSavedSearches(ctx: WorkspaceContext): Promise<SavedSearch[]> {
-  const rows = await db
-    .select()
-    .from(savedSearches)
-    .where(eq(savedSearches.workspaceId, ctx.workspaceId))
-    .orderBy(desc(savedSearches.createdAt));
+  const rows = await collections.savedSearches
+    .find({ workspaceId: ctx.workspaceId })
+    .sort({ createdAt: -1 })
+    .toArray();
   return rows.map((row) => ({
-    id: row.id,
+    id: row._id,
     provider: row.provider,
     country: row.country,
     city: row.city,
@@ -714,21 +730,21 @@ export async function createSavedSearch(
   ctx: WorkspaceContext,
   request: DiscoveryRequest & { enabled?: boolean },
 ): Promise<SavedSearch> {
-  const [row] = await db
-    .insert(savedSearches)
-    .values({
-      workspaceId: ctx.workspaceId,
-      provider: request.provider,
-      country: request.country,
-      city: request.city,
-      categories: request.categories,
-      limitCount: request.limit,
-      enabled: Boolean(request.enabled),
-    })
-    .returning();
-  if (!row) throw new Error("Could not save this search.");
+  const row: SavedSearchDoc = {
+    _id: newId(),
+    workspaceId: ctx.workspaceId,
+    provider: request.provider,
+    country: request.country,
+    city: request.city,
+    categories: request.categories,
+    limitCount: request.limit,
+    enabled: Boolean(request.enabled),
+    lastRunAt: null,
+    createdAt: now(),
+  };
+  await collections.savedSearches.insertOne(row);
   return {
-    id: row.id,
+    id: row._id,
     provider: row.provider,
     country: row.country,
     city: row.city,
@@ -741,16 +757,16 @@ export async function createSavedSearch(
 }
 
 export async function deleteSavedSearch(ctx: WorkspaceContext, id: string): Promise<void> {
-  const deleted = await db
-    .delete(savedSearches)
-    .where(and(eq(savedSearches.workspaceId, ctx.workspaceId), eq(savedSearches.id, id)))
-    .returning({ id: savedSearches.id });
-  if (!deleted.length) throw notFound("Saved search not found.");
+  const deleted = await collections.savedSearches.deleteOne({
+    workspaceId: ctx.workspaceId,
+    _id: id,
+  });
+  if (!deleted.deletedCount) throw notFound("Saved search not found.");
 }
 
 export async function markSavedSearchRun(ctx: WorkspaceContext, id: string): Promise<void> {
-  await db
-    .update(savedSearches)
-    .set({ lastRunAt: new Date() })
-    .where(and(eq(savedSearches.workspaceId, ctx.workspaceId), eq(savedSearches.id, id)));
+  await collections.savedSearches.updateOne(
+    { workspaceId: ctx.workspaceId, _id: id },
+    { $set: { lastRunAt: now() } },
+  );
 }

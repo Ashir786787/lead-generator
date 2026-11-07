@@ -10,6 +10,8 @@ import path from "node:path";
  */
 Object.assign(process.env, { NODE_ENV: "test" });
 process.env.LOG_LEVEL = "silent";
+// Tests never touch the development data: they use a disposable database.
+process.env.MONGODB_DB = "leadfinder_test";
 process.env.SCAN_PER_HOST_DELAY_MS = "0";
 process.env.SCAN_CONNECT_TIMEOUT_MS = "2000";
 process.env.SCAN_TOTAL_TIMEOUT_MS = "5000";

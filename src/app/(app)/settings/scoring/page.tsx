@@ -13,7 +13,7 @@ export default async function ScoringPage() {
       initial={{
         active: active
           ? {
-              id: active.id,
+              id: active._id,
               name: active.name,
               version: active.version,
               isActive: active.isActive,
@@ -22,7 +22,7 @@ export default async function ScoringPage() {
             }
           : null,
         profiles: profiles.map((profile) => ({
-          id: profile.id,
+          id: profile._id,
           name: profile.name,
           version: profile.version,
           isActive: profile.isActive,

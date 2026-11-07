@@ -1,42 +1,36 @@
-import { and, eq, inArray, isNull } from "drizzle-orm";
-import { db } from "@/lib/db";
-import {
-  activities,
-  businesses,
-  businessTags,
-  contactPoints,
-  notes,
-  tags,
-} from "@/lib/db/schema";
+import { collections, newId, now } from "@/lib/db";
+import type { ActivityType, BusinessDoc } from "@/lib/db/types";
 import type { WorkspaceContext } from "@/lib/auth/session";
 import { notFound } from "@/lib/api/errors";
 import { publishEvent } from "@/lib/events/bus";
+import { ensureTag, linkTag } from "@/lib/data/tags";
 import type { PipelineStatus } from "@/lib/constants";
 import { PIPELINE_STATUS_LABELS } from "@/lib/constants";
 
 async function logActivity(
   ctx: WorkspaceContext,
   businessId: string | null,
-  type: typeof activities.$inferInsert.type,
+  type: ActivityType,
   message: string,
   metadata?: Record<string, unknown>,
 ): Promise<void> {
-  await db.insert(activities).values({
+  await collections.activities.insertOne({
+    _id: newId(),
     workspaceId: ctx.workspaceId,
     businessId,
     type,
     message,
-    metadata,
+    metadata: metadata ?? null,
     actorId: ctx.user.id,
+    createdAt: now(),
   });
 }
 
 async function assertLead(ctx: WorkspaceContext, id: string) {
-  const [row] = await db
-    .select({ id: businesses.id, status: businesses.status, followUpAt: businesses.followUpAt, notes: businesses.notes })
-    .from(businesses)
-    .where(and(eq(businesses.workspaceId, ctx.workspaceId), eq(businesses.id, id)))
-    .limit(1);
+  const row = await collections.businesses.findOne(
+    { workspaceId: ctx.workspaceId, _id: id },
+    { projection: { _id: 1, status: 1, followUpAt: 1, notes: 1 } },
+  );
   if (!row) throw notFound("Lead not found");
   return row;
 }
@@ -52,7 +46,7 @@ export interface UpdateLeadPatch {
 
 export async function updateLead(ctx: WorkspaceContext, id: string, patch: UpdateLeadPatch): Promise<void> {
   const existing = await assertLead(ctx, id);
-  const updates: Partial<typeof businesses.$inferInsert> = { updatedAt: new Date() };
+  const updates: Partial<BusinessDoc> = { updatedAt: now() };
 
   if (patch.status !== undefined) {
     updates.status = patch.status;
@@ -68,10 +62,10 @@ export async function updateLead(ctx: WorkspaceContext, id: string, patch: Updat
   }
   if (patch.ownerId !== undefined) updates.ownerId = patch.ownerId;
 
-  await db
-    .update(businesses)
-    .set(updates)
-    .where(and(eq(businesses.workspaceId, ctx.workspaceId), eq(businesses.id, id)));
+  await collections.businesses.updateOne(
+    { workspaceId: ctx.workspaceId, _id: id },
+    { $set: updates },
+  );
 
   if (patch.status !== undefined && patch.status !== existing.status) {
     await logActivity(
@@ -84,11 +78,15 @@ export async function updateLead(ctx: WorkspaceContext, id: string, patch: Updat
   }
   if (patch.notes !== undefined && patch.notes !== existing.notes) {
     await logActivity(ctx, id, "note_added", "Notes updated");
-    await db.insert(notes).values({
+    const timestamp = now();
+    await collections.notes.insertOne({
+      _id: newId(),
       workspaceId: ctx.workspaceId,
       businessId: id,
       body: patch.notes ?? "",
       authorId: ctx.user.id,
+      createdAt: timestamp,
+      updatedAt: timestamp,
     });
   }
   if (patch.followUpAt !== undefined) {
@@ -120,27 +118,14 @@ export async function updateLead(ctx: WorkspaceContext, id: string, patch: Updat
 export async function setTags(ctx: WorkspaceContext, businessId: string, names: string[]): Promise<void> {
   const clean = [...new Set(names.map((name) => name.trim()).filter(Boolean))].slice(0, 20);
   const ids: string[] = [];
-  for (const name of clean) {
-    await db
-      .insert(tags)
-      .values({ workspaceId: ctx.workspaceId, name })
-      .onConflictDoNothing({ target: [tags.workspaceId, tags.name] });
-    const [tag] = await db
-      .select({ id: tags.id })
-      .from(tags)
-      .where(and(eq(tags.workspaceId, ctx.workspaceId), eq(tags.name, name)))
-      .limit(1);
-    if (tag) ids.push(tag.id);
-  }
-  await db
-    .delete(businessTags)
-    .where(and(eq(businessTags.workspaceId, ctx.workspaceId), eq(businessTags.businessId, businessId)));
-  if (ids.length) {
-    await db
-      .insert(businessTags)
-      .values(ids.map((tagId) => ({ workspaceId: ctx.workspaceId, businessId, tagId })))
-      .onConflictDoNothing();
-  }
+  for (const name of clean) ids.push(await ensureTag(ctx.workspaceId, name));
+
+  await collections.businessTags.deleteMany({
+    workspaceId: ctx.workspaceId,
+    businessId,
+  });
+  for (const tagId of ids) await linkTag(ctx.workspaceId, businessId, tagId);
+
   await logActivity(ctx, businessId, "tag_added", clean.length ? `Tags: ${clean.join(", ")}` : "Tags cleared");
 }
 
@@ -149,16 +134,15 @@ export async function setContactVerified(
   contactId: string,
   verified: boolean,
 ): Promise<void> {
-  const [contact] = await db
-    .select({ id: contactPoints.id, businessId: contactPoints.businessId })
-    .from(contactPoints)
-    .where(and(eq(contactPoints.workspaceId, ctx.workspaceId), eq(contactPoints.id, contactId)))
-    .limit(1);
+  const contact = await collections.contactPoints.findOne(
+    { workspaceId: ctx.workspaceId, _id: contactId },
+    { projection: { _id: 1, businessId: 1 } },
+  );
   if (!contact) throw notFound("Contact not found");
-  await db
-    .update(contactPoints)
-    .set({ verifiedByUser: verified })
-    .where(and(eq(contactPoints.workspaceId, ctx.workspaceId), eq(contactPoints.id, contactId)));
+  await collections.contactPoints.updateOne(
+    { workspaceId: ctx.workspaceId, _id: contactId },
+    { $set: { verifiedByUser: verified } },
+  );
   await logActivity(
     ctx,
     contact.businessId,
@@ -173,33 +157,35 @@ export async function bulkSetStatus(
   ids: string[],
   status: PipelineStatus,
 ): Promise<number> {
-  const scoped = await db
-    .select({ id: businesses.id })
-    .from(businesses)
-    .where(
-      and(
-        eq(businesses.workspaceId, ctx.workspaceId),
-        inArray(businesses.id, ids),
-        isNull(businesses.mergedIntoId),
-      ),
-    );
-  const scopedIds = scoped.map((row) => row.id);
+  const scoped = await collections.businesses
+    .find(
+      { workspaceId: ctx.workspaceId, _id: { $in: ids }, mergedIntoId: null },
+      { projection: { _id: 1 } },
+    )
+    .toArray();
+  const scopedIds = scoped.map((row) => row._id);
   if (!scopedIds.length) return 0;
-  await db
-    .update(businesses)
-    .set({
-      status,
-      ...(status === "do_not_contact" ? { doNotContact: true } : {}),
-      updatedAt: new Date(),
-    })
-    .where(and(eq(businesses.workspaceId, ctx.workspaceId), inArray(businesses.id, scopedIds)));
-  await db.insert(activities).values(
+  await collections.businesses.updateMany(
+    { workspaceId: ctx.workspaceId, _id: { $in: scopedIds } },
+    {
+      $set: {
+        status,
+        ...(status === "do_not_contact" ? { doNotContact: true } : {}),
+        updatedAt: now(),
+      },
+    },
+  );
+  const timestamp = now();
+  await collections.activities.insertMany(
     scopedIds.map((id) => ({
+      _id: newId(),
       workspaceId: ctx.workspaceId,
       businessId: id,
       type: "status_changed" as const,
       message: `Status changed to ${PIPELINE_STATUS_LABELS[status]} (bulk)`,
+      metadata: null,
       actorId: ctx.user.id,
+      createdAt: timestamp,
     })),
   );
   await publishEvent(ctx.workspaceId, "lead.updated", { count: scopedIds.length });
@@ -207,22 +193,19 @@ export async function bulkSetStatus(
 }
 
 export async function bulkArchive(ctx: WorkspaceContext, ids: string[]): Promise<number> {
-  const scoped = await db
-    .select({ id: businesses.id })
-    .from(businesses)
-    .where(
-      and(
-        eq(businesses.workspaceId, ctx.workspaceId),
-        inArray(businesses.id, ids),
-        isNull(businesses.mergedIntoId),
-      ),
-    );
-  const scopedIds = scoped.map((row) => row.id);
+  const scoped = await collections.businesses
+    .find(
+      { workspaceId: ctx.workspaceId, _id: { $in: ids }, mergedIntoId: null },
+      { projection: { _id: 1 } },
+    )
+    .toArray();
+  const scopedIds = scoped.map((row) => row._id);
   if (!scopedIds.length) return 0;
-  await db
-    .update(businesses)
-    .set({ archivedAt: new Date(), updatedAt: new Date() })
-    .where(and(eq(businesses.workspaceId, ctx.workspaceId), inArray(businesses.id, scopedIds)));
+  const timestamp = now();
+  await collections.businesses.updateMany(
+    { workspaceId: ctx.workspaceId, _id: { $in: scopedIds } },
+    { $set: { archivedAt: timestamp, updatedAt: timestamp } },
+  );
   await publishEvent(ctx.workspaceId, "lead.updated", { count: scopedIds.length, archived: true });
   return scopedIds.length;
 }
@@ -230,39 +213,29 @@ export async function bulkArchive(ctx: WorkspaceContext, ids: string[]): Promise
 export async function bulkAddTag(ctx: WorkspaceContext, ids: string[], tagName: string): Promise<number> {
   const name = tagName.trim();
   if (!name) return 0;
-  const scoped = await db
-    .select({ id: businesses.id })
-    .from(businesses)
-    .where(
-      and(
-        eq(businesses.workspaceId, ctx.workspaceId),
-        inArray(businesses.id, ids),
-        isNull(businesses.mergedIntoId),
-      ),
-    );
-  const scopedIds = scoped.map((row) => row.id);
+  const scoped = await collections.businesses
+    .find(
+      { workspaceId: ctx.workspaceId, _id: { $in: ids }, mergedIntoId: null },
+      { projection: { _id: 1 } },
+    )
+    .toArray();
+  const scopedIds = scoped.map((row) => row._id);
   if (!scopedIds.length) return 0;
-  await db
-    .insert(tags)
-    .values({ workspaceId: ctx.workspaceId, name })
-    .onConflictDoNothing({ target: [tags.workspaceId, tags.name] });
-  const [tag] = await db
-    .select({ id: tags.id })
-    .from(tags)
-    .where(and(eq(tags.workspaceId, ctx.workspaceId), eq(tags.name, name)))
-    .limit(1);
-  if (!tag) return 0;
-  await db
-    .insert(businessTags)
-    .values(scopedIds.map((businessId) => ({ workspaceId: ctx.workspaceId, businessId, tagId: tag.id })))
-    .onConflictDoNothing();
-  await db.insert(activities).values(
+  const tagId = await ensureTag(ctx.workspaceId, name);
+  for (const businessId of scopedIds) {
+    await linkTag(ctx.workspaceId, businessId, tagId);
+  }
+  const timestamp = now();
+  await collections.activities.insertMany(
     scopedIds.map((businessId) => ({
+      _id: newId(),
       workspaceId: ctx.workspaceId,
       businessId,
       type: "tag_added" as const,
       message: `Tag added: ${name} (bulk)`,
+      metadata: null,
       actorId: ctx.user.id,
+      createdAt: timestamp,
     })),
   );
   await publishEvent(ctx.workspaceId, "lead.updated", { count: scopedIds.length });

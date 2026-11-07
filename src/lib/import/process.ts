@@ -1,9 +1,11 @@
-import fs from "node:fs/promises";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
-import { db } from "@/lib/db";
-import { importJobs, workspaces } from "@/lib/db/schema";
-import { storageRoot, materializeUpload, resolveStoredPath } from "@/lib/storage";
+import { collections, now } from "@/lib/db";
+import {
+  storageRoot,
+  materializeUpload,
+  deleteStored,
+  removeTempDirectory,
+} from "@/lib/storage";
 import { iterateFile, countRowsHint } from "./parse";
 import { finalizeImportJob, ingestRecords, type IngestCounts } from "./ingest";
 import { publishEvent } from "@/lib/events/bus";
@@ -17,50 +19,36 @@ export interface ImportProcessResult {
 }
 
 export async function processImport(workspaceId: string, importJobId: string): Promise<ImportProcessResult> {
-  const [job] = await db
-    .select({
-      status: importJobs.status,
-      storagePath: importJobs.storagePath,
-      fileData: importJobs.fileData,
-      rowCount: importJobs.rowCount,
-      createdBy: importJobs.createdBy,
-      filename: importJobs.filename,
-      mapping: importJobs.mapping,
-    })
-    .from(importJobs)
-    .where(and(eq(importJobs.workspaceId, workspaceId), eq(importJobs.id, importJobId)))
-    .limit(1);
+  const job = await collections.importJobs.findOne({
+    workspaceId,
+    _id: importJobId,
+  });
   if (!job) return { status: "failed", error: "Import job not found." };
   if (job.status === "completed" || job.status === "cancelled") return { status: "skipped" };
-  if (!job.storagePath && !job.fileData) {
+  if (!job.storagePath) {
     await failImport(workspaceId, importJobId, "The uploaded file is missing from storage.");
     return { status: "failed", error: "The uploaded file is missing from storage." };
   }
 
-  const [workspace] = await db
-    .select({ isDemo: workspaces.isDemo })
-    .from(workspaces)
-    .where(eq(workspaces.id, workspaceId))
-    .limit(1);
+  const workspace = await collections.workspaces.findOne(
+    { _id: workspaceId },
+    { projection: { _id: 1, isDemo: 1 } },
+  );
   if (!workspace) {
     await failImport(workspaceId, importJobId, "The workspace no longer exists.");
     return { status: "failed", error: "The workspace no longer exists." };
   }
 
   const workDir = path.join(storageRoot, "tmp", `import-${importJobId}`);
-  await db
-    .update(importJobs)
-    .set({ status: "processing", startedAt: new Date(), progress: 1, error: null })
-    .where(and(eq(importJobs.workspaceId, workspaceId), eq(importJobs.id, importJobId)));
+  await collections.importJobs.updateOne(
+    { workspaceId, _id: importJobId },
+    { $set: { status: "processing", startedAt: now(), progress: 1, error: null } },
+  );
 
   try {
-    await fs.rm(workDir, { recursive: true, force: true });
-    await fs.mkdir(workDir, { recursive: true });
-    // Local mode reads the persisted upload; serverless mode writes the
-    // database copy into the only writable directory (/tmp) for streaming.
-    const filePath = job.storagePath
-      ? resolveStoredPath(job.storagePath)
-      : await materializeUpload(workDir, job.filename, job.fileData ?? "");
+    await removeTempDirectory(workDir);
+    // GridFS is the durable copy; the parsers need a real file to stream.
+    const filePath = await materializeUpload(job.storagePath, workDir, job.filename);
     const totalHint = job.rowCount > 0 ? job.rowCount : (await countRowsHint(filePath)) ?? undefined;
 
     const actor = { workspaceId, userId: job.createdBy, isDemo: workspace.isDemo };
@@ -77,27 +65,29 @@ export async function processImport(workspaceId: string, importJobId: string): P
       totalHint,
       records: iterateFile(filePath, job.filename, workDir),
       onProgress: async (current, processed) => {
-        const now = Date.now();
-        if (now - lastWrite < 400 && processed !== totalHint) return;
-        lastWrite = now;
+        const moment = Date.now();
+        if (moment - lastWrite < 400 && processed !== totalHint) return;
+        lastWrite = moment;
         const progress = totalHint
           ? Math.min(99, Math.max(2, Math.floor((processed / totalHint) * 100)))
           : Math.min(95, 2 + Math.floor(processed / 25));
-        await db
-          .update(importJobs)
-          .set({
-            processedRows: processed,
-            progress,
-            rowCount: totalHint ?? processed,
-            newCount: current.newCount,
-            mergedCount: current.mergedCount,
-            duplicateCount: current.duplicateCount,
-            skippedCount: current.skippedCount,
-            errorCount: current.errorCount,
-            reviewCount: current.reviewCount,
-            validCount: current.validCount,
-          })
-          .where(and(eq(importJobs.workspaceId, workspaceId), eq(importJobs.id, importJobId)));
+        await collections.importJobs.updateOne(
+          { workspaceId, _id: importJobId },
+          {
+            $set: {
+              processedRows: processed,
+              progress,
+              rowCount: totalHint ?? processed,
+              newCount: current.newCount,
+              mergedCount: current.mergedCount,
+              duplicateCount: current.duplicateCount,
+              skippedCount: current.skippedCount,
+              errorCount: current.errorCount,
+              reviewCount: current.reviewCount,
+              validCount: current.validCount,
+            },
+          },
+        );
         await publishEvent(workspaceId, "import.progress", {
           importJobId,
           processed,
@@ -115,13 +105,16 @@ export async function processImport(workspaceId: string, importJobId: string): P
     }
 
     await finalizeImportJob(actor, importJobId, counts);
-    if (job.fileData) {
-      // The import is complete; drop the base64 copy to keep the database small.
-      await db
-        .update(importJobs)
-        .set({ fileData: null })
-        .where(and(eq(importJobs.workspaceId, workspaceId), eq(importJobs.id, importJobId)));
-    }
+
+    // The file is only needed while the import runs. Dropping the GridFS copy
+    // keeps the shared Atlas quota free; the job row keeps the hash for
+    // duplicate-upload detection.
+    await deleteStored(job.storagePath);
+    await collections.importJobs.updateOne(
+      { workspaceId, _id: importJobId },
+      { $set: { storagePath: null } },
+    );
+
     return { status: "completed", counts };
   } catch (error) {
     const message = error instanceof Error ? error.message : "The import could not be completed.";
@@ -129,19 +122,21 @@ export async function processImport(workspaceId: string, importJobId: string): P
     await failImport(workspaceId, importJobId, message);
     return { status: "failed", error: message };
   } finally {
-    await fs.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+    await removeTempDirectory(workDir);
   }
 }
 
 async function failImport(workspaceId: string, importJobId: string, message: string): Promise<void> {
-  await db
-    .update(importJobs)
-    .set({
-      status: "failed",
-      error: message.slice(0, 2000),
-      finishedAt: new Date(),
-      progress: 100,
-    })
-    .where(and(eq(importJobs.workspaceId, workspaceId), eq(importJobs.id, importJobId)));
+  await collections.importJobs.updateOne(
+    { workspaceId, _id: importJobId },
+    {
+      $set: {
+        status: "failed",
+        error: message.slice(0, 2000),
+        finishedAt: now(),
+        progress: 100,
+      },
+    },
+  );
   await publishEvent(workspaceId, "import.failed", { importJobId, message });
 }

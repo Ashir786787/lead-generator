@@ -212,7 +212,6 @@ export function LeadDetailView({ initial, timezone }: { initial: LeadDetail; tim
     try {
       const result = await apiFetch<{
         results: Array<{ scanJobId: string | null; reason?: string; outcome?: string }>;
-        workerOnline?: boolean;
         inline?: boolean;
       }>(`/api/leads/${lead.id}/scan`, { method: "POST", body: JSON.stringify({}) });
       const item = result.results[0];
@@ -220,8 +219,6 @@ export function LeadDetailView({ initial, timezone }: { initial: LeadDetail; tim
         if (item.outcome === "success") toast.success("Website scan completed.");
         else if (item.outcome === "cancelled") toast.info("Scan cancelled.");
         else toast.warning(`Website scan finished with “${item.outcome ?? "unknown"}”. Check the scan details.`);
-      } else if (item?.scanJobId && result.workerOnline === false) {
-        toast.warning("Scan queued, but the scan worker is offline. Start it with pnpm worker.");
       } else if (item?.scanJobId) {
         toast.success("Website scan queued.");
       } else if (item?.reason === "no_website") toast.error("This lead has no website to scan.");
@@ -621,7 +618,7 @@ export function LeadDetailView({ initial, timezone }: { initial: LeadDetail; tim
                       <Loader2 className="size-4 animate-spin" /> Scan {activeScan.status}…
                     </p>
                     <p className="text-sm text-muted-foreground">
-                      Queued {relativeTime(activeScan.createdAt)}. Results appear here when the worker finishes.
+                      Queued {relativeTime(activeScan.createdAt)}. Results appear here when the scan finishes.
                     </p>
                   </div>
                 ) : (

@@ -16,9 +16,7 @@ import {
   TrendingUp,
   Users,
 } from "lucide-react";
-import { desc, eq } from "drizzle-orm";
-import { db } from "@/lib/db";
-import { activities } from "@/lib/db/schema";
+import { collections } from "@/lib/db";
 import { getWorkspaceContext } from "@/lib/auth/session";
 import { getWorkspaceOverview } from "@/lib/data/facets";
 import { listLeads } from "@/lib/data/leads";
@@ -42,17 +40,22 @@ export default async function DashboardPage() {
     listLeads(ctx, parseLeadQuery({ sort: "score_desc", pageSize: "6" })),
     listImports(ctx),
     scanQueueSummary(ctx),
-    db
-      .select({
-        id: activities.id,
-        type: activities.type,
-        message: activities.message,
-        createdAt: activities.createdAt,
-      })
-      .from(activities)
-      .where(eq(activities.workspaceId, ctx.workspaceId))
-      .orderBy(desc(activities.createdAt))
-      .limit(8),
+    collections.activities
+      .find(
+        { workspaceId: ctx.workspaceId },
+        { projection: { _id: 1, type: 1, message: 1, createdAt: 1 } },
+      )
+      .sort({ createdAt: -1 })
+      .limit(8)
+      .toArray()
+      .then((activities) =>
+        activities.map((activity) => ({
+          id: activity._id,
+          type: activity.type,
+          message: activity.message,
+          createdAt: activity.createdAt,
+        })),
+      ),
   ]);
 
   const pipeline: Array<{ status: PipelineStatus; count: number }> = [

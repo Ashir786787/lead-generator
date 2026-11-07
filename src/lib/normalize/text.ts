@@ -68,6 +68,21 @@ export function normalizeName(value: string): string {
   return result.trim();
 }
 
+/**
+ * Indexable token set for duplicate lookup. Stored on each business so a
+ * candidate scan can use an indexed `$in` query instead of comparing every row.
+ */
+export function nameTokens(normalizedName: string): string[] {
+  return [
+    ...new Set(
+      normalizedName
+        .split(" ")
+        .map((token) => token.trim())
+        .filter((token) => token.length > 1),
+    ),
+  ].slice(0, 20);
+}
+
 export function normalizeCity(value: string): string {
   const cleaned = stripDiacritics(value).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
   const aliases: Record<string, string> = {

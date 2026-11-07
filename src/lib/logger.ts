@@ -18,7 +18,7 @@ export const logger = pino({
       "req.headers.cookie",
       "headers.cookie",
       "GOOGLE_PLACES_API_KEY",
-      "DATABASE_URL",
+      "MONGODB_URI",
     ],
     censor: "[redacted]",
   },

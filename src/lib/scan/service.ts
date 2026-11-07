@@ -1,20 +1,28 @@
-import { and, count, countDistinct, desc, eq, inArray, isNotNull, isNull, lt, sql } from "drizzle-orm";
-import { db } from "@/lib/db";
-import { businesses, scanJobs, scanResults } from "@/lib/db/schema";
+import { collections, newId, now } from "@/lib/db";
+import type { ScanJobDoc, ScanOutcome } from "@/lib/db/types";
 import type { WorkspaceContext } from "@/lib/auth/session";
 import { conflict, notFound } from "@/lib/api/errors";
 import { publishEvent } from "@/lib/events/bus";
-import { sendJob, JOB_NAMES } from "@/lib/jobs/boss";
-import { getWorkerHealth, isScanWorkerOnline } from "@/lib/jobs/health";
 import { env } from "@/lib/env";
 
 export interface QueuedScan {
   businessId: string;
   scanJobId: string | null;
   reason?: "no_website" | "already_running" | "not_found";
-  /** Present when the scan ran inline (serverless mode). */
+  /** Present when the scan ran inline. */
   outcome?: string;
 }
+
+const BAD_OUTCOMES: ScanOutcome[] = [
+  "partial",
+  "blocked_by_robots",
+  "unreachable",
+  "timeout",
+  "tls_error",
+  "non_html",
+  "rejected_url",
+  "error",
+];
 
 export async function queueScans(
   ctx: WorkspaceContext,
@@ -23,54 +31,50 @@ export async function queueScans(
 ): Promise<QueuedScan[]> {
   const ids = [...new Set(businessIds)].slice(0, 100);
   if (!ids.length) return [];
-  const rows = await db
-    .select({
-      id: businesses.id,
-      websiteUrl: businesses.websiteUrl,
-      mergedIntoId: businesses.mergedIntoId,
-    })
-    .from(businesses)
-    .where(and(eq(businesses.workspaceId, ctx.workspaceId), inArray(businesses.id, ids)));
+  const rows = await collections.businesses
+    .find(
+      { workspaceId: ctx.workspaceId, _id: { $in: ids } },
+      { projection: { _id: 1, websiteUrl: 1, mergedIntoId: 1 } },
+    )
+    .toArray();
 
-  const found = new Map(rows.map((row) => [row.id, row]));
+  const found = new Map(rows.map((row) => [row._id, row]));
 
-  if (env.inlineJobs) {
-    // A request killed by the platform can leave a scan "processing" forever.
-    // Clear stale rows so the lead can be scanned again.
-    const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
-    await db
-      .update(scanJobs)
-      .set({
+  // A request killed by the platform can leave a scan "processing" forever.
+  // Clear stale rows so the lead can be scanned again.
+  const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
+  await collections.scanJobs.updateMany(
+    {
+      workspaceId: ctx.workspaceId,
+      businessId: { $in: ids },
+      status: { $in: ["queued", "processing"] },
+      createdAt: { $lt: staleCutoff },
+    },
+    {
+      $set: {
         status: "failed",
         error: "An earlier inline scan did not finish before the request ended. Retry the scan.",
-        finishedAt: new Date(),
+        finishedAt: now(),
         progress: 100,
-      })
-      .where(
-        and(
-          eq(scanJobs.workspaceId, ctx.workspaceId),
-          inArray(scanJobs.businessId, ids),
-          inArray(scanJobs.status, ["queued", "processing"]),
-          lt(scanJobs.createdAt, staleCutoff),
-        ),
-      );
-  }
+      },
+    },
+  );
 
-  const active = await db
-    .select({ businessId: scanJobs.businessId })
-    .from(scanJobs)
-    .where(
-      and(
-        eq(scanJobs.workspaceId, ctx.workspaceId),
-        inArray(scanJobs.businessId, ids),
-        inArray(scanJobs.status, ["queued", "processing"]),
-      ),
-    );
+  const active = await collections.scanJobs
+    .find(
+      {
+        workspaceId: ctx.workspaceId,
+        businessId: { $in: ids },
+        status: { $in: ["queued", "processing"] },
+      },
+      { projection: { _id: 0, businessId: 1 } },
+    )
+    .toArray();
   const activeSet = new Set(active.map((row) => row.businessId));
 
   // Serverless requests have a hard duration cap, so inline work gets a budget
   // and any remaining scans are marked failed with an honest explanation.
-  const inlineDeadline = env.inlineJobs ? Date.now() + env.inlineJobBudgetMs : Number.POSITIVE_INFINITY;
+  const inlineDeadline = Date.now() + env.inlineJobBudgetMs;
 
   const results: QueuedScan[] = [];
   for (const id of ids) {
@@ -87,67 +91,64 @@ export async function queueScans(
       results.push({ businessId: id, scanJobId: null, reason: "already_running" });
       continue;
     }
-    const [job] = await db
-      .insert(scanJobs)
-      .values({
-        workspaceId: ctx.workspaceId,
-        businessId: id,
-        requestedBy: ctx.user.id,
-        force,
-        status: "queued",
-      })
-      .returning({ id: scanJobs.id });
-    if (!job) {
-      results.push({ businessId: id, scanJobId: null, reason: "not_found" });
+
+    const timestamp = now();
+    const job: ScanJobDoc = {
+      _id: newId(),
+      workspaceId: ctx.workspaceId,
+      businessId: id,
+      requestedBy: ctx.user.id,
+      status: "queued",
+      outcome: null,
+      progress: 0,
+      pagesTotal: 0,
+      pagesDone: 0,
+      force,
+      cancelRequested: false,
+      error: null,
+      createdAt: timestamp,
+      startedAt: null,
+      finishedAt: null,
+    };
+    await collections.scanJobs.insertOne(job);
+    await publishEvent(ctx.workspaceId, "scan.queued", { businessId: id, scanJobId: job._id });
+
+    if (Date.now() >= inlineDeadline) {
+      const message =
+        "The serverless request time limit was reached before this scan could run. Retry it in a smaller batch.";
+      await collections.scanJobs.updateOne(
+        { workspaceId: ctx.workspaceId, _id: job._id },
+        { $set: { status: "failed", error: message, finishedAt: now(), progress: 100 } },
+      );
+      await publishEvent(ctx.workspaceId, "scan.failed", { scanJobId: job._id, message });
+      results.push({ businessId: id, scanJobId: job._id, outcome: "error" });
       continue;
     }
-    await publishEvent(ctx.workspaceId, "scan.queued", { businessId: id, scanJobId: job.id });
-
-    if (env.inlineJobs) {
-      if (Date.now() >= inlineDeadline) {
-        const message =
-          "The serverless request time limit was reached before this scan could run. Retry it in a smaller batch.";
-        await db
-          .update(scanJobs)
-          .set({ status: "failed", error: message, finishedAt: new Date(), progress: 100 })
-          .where(and(eq(scanJobs.workspaceId, ctx.workspaceId), eq(scanJobs.id, job.id)));
-        await publishEvent(ctx.workspaceId, "scan.failed", { scanJobId: job.id, message });
-        results.push({ businessId: id, scanJobId: job.id, outcome: "error" });
-        continue;
-      }
-      const { processScan } = await import("./process");
-      const outcome = await processScan(ctx.workspaceId, id, job.id, force);
-      results.push({ businessId: id, scanJobId: job.id, outcome: outcome.outcome });
-      continue;
-    }
-
-    await sendJob(
-      JOB_NAMES.scanBusiness,
-      { workspaceId: ctx.workspaceId, businessId: id, scanJobId: job.id, force },
-      { singletonKey: `scan:${job.id}`, retryLimit: 1, expireInSeconds: 10 * 60 },
-    );
-    results.push({ businessId: id, scanJobId: job.id });
+    const { processScan } = await import("./process");
+    const outcome = await processScan(ctx.workspaceId, id, job._id, force);
+    results.push({ businessId: id, scanJobId: job._id, outcome: outcome.outcome });
   }
   return results;
 }
 
 export async function cancelScan(ctx: WorkspaceContext, scanJobId: string): Promise<void> {
-  const [job] = await db
-    .select({ id: scanJobs.id, status: scanJobs.status })
-    .from(scanJobs)
-    .where(and(eq(scanJobs.workspaceId, ctx.workspaceId), eq(scanJobs.id, scanJobId)))
-    .limit(1);
+  const job = await collections.scanJobs.findOne(
+    { workspaceId: ctx.workspaceId, _id: scanJobId },
+    { projection: { _id: 1, status: 1 } },
+  );
   if (!job) throw notFound("Scan not found.");
   if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
     throw conflict("This scan has already finished.");
   }
-  await db
-    .update(scanJobs)
-    .set({
-      cancelRequested: true,
-      ...(job.status === "queued" ? { status: "cancelled", finishedAt: new Date() } : {}),
-    })
-    .where(and(eq(scanJobs.workspaceId, ctx.workspaceId), eq(scanJobs.id, scanJobId)));
+  await collections.scanJobs.updateOne(
+    { workspaceId: ctx.workspaceId, _id: scanJobId },
+    {
+      $set: {
+        cancelRequested: true,
+        ...(job.status === "queued" ? { status: "cancelled", finishedAt: now() } : {}),
+      },
+    },
+  );
   await publishEvent(ctx.workspaceId, "job.cancelled", { scanJobId });
 }
 
@@ -169,33 +170,28 @@ export async function listScanJobs(
   ctx: WorkspaceContext,
   businessId?: string,
 ): Promise<ScanJobSummary[]> {
-  const rows = await db
-    .select({
-      id: scanJobs.id,
-      businessId: scanJobs.businessId,
-      businessName: businesses.name,
-      status: scanJobs.status,
-      outcome: scanJobs.outcome,
-      progress: scanJobs.progress,
-      pagesTotal: scanJobs.pagesTotal,
-      pagesDone: scanJobs.pagesDone,
-      createdAt: scanJobs.createdAt,
-      finishedAt: scanJobs.finishedAt,
-      error: scanJobs.error,
-    })
-    .from(scanJobs)
-    .innerJoin(businesses, eq(businesses.id, scanJobs.businessId))
-    .where(
-      businessId
-        ? and(eq(scanJobs.workspaceId, ctx.workspaceId), eq(scanJobs.businessId, businessId))
-        : eq(scanJobs.workspaceId, ctx.workspaceId),
-    )
-    .orderBy(desc(scanJobs.createdAt))
-    .limit(50);
+  const filter = businessId
+    ? { workspaceId: ctx.workspaceId, businessId }
+    : { workspaceId: ctx.workspaceId };
+  const rows = await collections.scanJobs
+    .find(filter)
+    .sort({ createdAt: -1 })
+    .limit(50)
+    .toArray();
+  const businessIds = [...new Set(rows.map((row) => row.businessId))];
+  const businesses = businessIds.length
+    ? await collections.businesses
+        .find(
+          { _id: { $in: businessIds } },
+          { projection: { _id: 1, name: 1 } },
+        )
+        .toArray()
+    : [];
+  const nameById = new Map(businesses.map((business) => [business._id, business.name]));
   return rows.map((row) => ({
-    id: row.id,
+    id: row._id,
     businessId: row.businessId,
-    businessName: row.businessName,
+    businessName: nameById.get(row.businessId) ?? null,
     status: row.status,
     outcome: row.outcome,
     progress: row.progress,
@@ -214,56 +210,33 @@ export async function scanQueueSummary(ctx: WorkspaceContext): Promise<{
   neverChecked: number;
   workerOnline: boolean;
 }> {
-  const [jobs, neverChecked, needsReview, worker] = await Promise.all([
-    db
-      .select({
-        queued: sql<number>`count(*) filter (where ${scanJobs.status} = 'queued')`,
-        running: sql<number>`count(*) filter (where ${scanJobs.status} = 'processing')`,
-      })
-      .from(scanJobs)
-      .where(
-        and(
-          eq(scanJobs.workspaceId, ctx.workspaceId),
-          inArray(scanJobs.status, ["queued", "processing"]),
-        ),
-      ),
-    db
-      .select({ value: count() })
-      .from(businesses)
-      .where(
-        and(
-          eq(businesses.workspaceId, ctx.workspaceId),
-          isNull(businesses.mergedIntoId),
-          isNull(businesses.lastCheckedAt),
-          isNotNull(businesses.websiteUrl),
-        ),
-      ),
-    db
-      .select({ value: countDistinct(scanResults.businessId) })
-      .from(scanResults)
-      .where(
-        and(
-          eq(scanResults.workspaceId, ctx.workspaceId),
-          inArray(scanResults.outcome, [
-            "partial",
-            "blocked_by_robots",
-            "unreachable",
-            "timeout",
-            "tls_error",
-            "non_html",
-            "rejected_url",
-            "error",
-          ]),
-        ),
-      ),
-    getWorkerHealth(),
+  const [queued, running, neverChecked, badBusinessIds] = await Promise.all([
+    collections.scanJobs.countDocuments({
+      workspaceId: ctx.workspaceId,
+      status: "queued",
+    }),
+    collections.scanJobs.countDocuments({
+      workspaceId: ctx.workspaceId,
+      status: "processing",
+    }),
+    collections.businesses.countDocuments({
+      workspaceId: ctx.workspaceId,
+      mergedIntoId: null,
+      lastCheckedAt: null,
+      websiteUrl: { $ne: null },
+    }),
+    collections.scanResults.distinct("businessId", {
+      workspaceId: ctx.workspaceId,
+      outcome: { $in: BAD_OUTCOMES },
+    }),
   ]);
   return {
-    queued: Number(jobs[0]?.queued ?? 0),
-    running: Number(jobs[0]?.running ?? 0),
-    needsReview: Number(needsReview[0]?.value ?? 0),
-    neverChecked: Number(neverChecked[0]?.value ?? 0),
-    workerOnline: isScanWorkerOnline(worker),
+    queued,
+    running,
+    needsReview: badBusinessIds.length,
+    neverChecked,
+    // Jobs always run inline in the request, so scanning is always available.
+    workerOnline: true,
   };
 }
 

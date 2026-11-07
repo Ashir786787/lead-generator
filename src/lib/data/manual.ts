@@ -1,21 +1,11 @@
-import { and, eq } from "drizzle-orm";
 import { api } from "@/lib/api/errors";
 import type { WorkspaceContext } from "@/lib/auth/session";
-import { db } from "@/lib/db";
-import {
-  activities,
-  businesses,
-  businessLocations,
-  businessTags,
-  categoryMappings,
-  contactPoints,
-  evidenceRecords,
-  sourceRecords,
-  tags,
-} from "@/lib/db/schema";
+import { collections, newId, now } from "@/lib/db";
+import type { BusinessDoc, ContactPointDoc, EvidenceRecordDoc } from "@/lib/db/types";
 import { findBestMatch, mergeBusinesses, recordDuplicateCandidate } from "@/lib/dedupe/service";
-import { normalizeBusiness } from "@/lib/normalize";
+import { normalizeBusiness, nameTokens } from "@/lib/normalize";
 import { recalculateLeadScore } from "@/lib/score/service";
+import { ensureTag, linkTag } from "@/lib/data/tags";
 import type { CategoryKey } from "@/lib/score/types";
 import type { PipelineStatus } from "@/lib/constants";
 import { publishEvent } from "@/lib/events/bus";
@@ -47,12 +37,11 @@ export interface ManualLeadResult {
 }
 
 async function categoryOverrides(workspaceId: string): Promise<Record<string, CategoryKey>> {
-  const rows = await db
-    .select({ pattern: categoryMappings.rawPattern, key: categoryMappings.categoryKey })
-    .from(categoryMappings)
-    .where(eq(categoryMappings.workspaceId, workspaceId));
+  const rows = await collections.categoryMappings
+    .find({ workspaceId }, { projection: { rawPattern: 1, categoryKey: 1 } })
+    .toArray();
   const overrides: Record<string, CategoryKey> = {};
-  for (const row of rows) overrides[row.pattern.toLowerCase()] = row.key as CategoryKey;
+  for (const row of rows) overrides[row.rawPattern.toLowerCase()] = row.categoryKey as CategoryKey;
   return overrides;
 }
 
@@ -101,41 +90,54 @@ export async function createManualLead(
     lng: normalized.lng,
   });
 
-  const [inserted] = await db
-    .insert(businesses)
-    .values({
-      workspaceId: ctx.workspaceId,
-      name: normalized.name,
-      normalizedName: normalized.normalizedName,
-      category: normalized.category,
-      categoryKey: normalized.categoryKey,
-      phone: input.phone?.trim() || null,
-      phoneE164: normalized.phone?.e164 ?? null,
-      email: normalized.emailDisplay,
-      emailNormalized: normalized.email,
-      websiteUrl: normalized.website?.url ?? null,
-      websiteHost: normalized.website?.host ?? null,
-      street: normalized.street,
-      area: normalized.area,
-      city: normalized.city,
-      country: normalized.country,
-      lat: normalized.lat,
-      lng: normalized.lng,
-      status: input.doNotContact ? "do_not_contact" : input.status ?? "new",
-      doNotContact: Boolean(input.doNotContact),
-      notes: input.notes?.trim() || null,
-      followUpAt: input.followUpAt ? new Date(input.followUpAt) : null,
-      ownerId: input.ownerId ?? ctx.user.id,
-      isDemo: ctx.isDemo,
-    })
-    .returning({ id: businesses.id });
-  if (!inserted) throw api.conflict("Could not create the lead.");
+  const timestamp = now();
+  const businessId = newId();
+  const business: BusinessDoc = {
+    _id: businessId,
+    workspaceId: ctx.workspaceId,
+    name: normalized.name,
+    normalizedName: normalized.normalizedName,
+    nameTokens: nameTokens(normalized.normalizedName),
+    category: normalized.category,
+    categoryKey: normalized.categoryKey,
+    phone: input.phone?.trim() || null,
+    phoneE164: normalized.phone?.e164 ?? null,
+    email: normalized.emailDisplay,
+    emailNormalized: normalized.email,
+    websiteUrl: normalized.website?.url ?? null,
+    websiteHost: normalized.website?.host ?? null,
+    street: normalized.street,
+    area: normalized.area,
+    city: normalized.city,
+    country: normalized.country,
+    lat: normalized.lat,
+    lng: normalized.lng,
+    status: input.doNotContact ? "do_not_contact" : input.status ?? "new",
+    ownerId: input.ownerId ?? ctx.user.id,
+    doNotContact: Boolean(input.doNotContact),
+    followUpAt: input.followUpAt ? new Date(input.followUpAt) : null,
+    notes: input.notes?.trim() || null,
+    fieldLocks: [],
+    latestScore: null,
+    latestScoreResultId: null,
+    latestScanId: null,
+    latestScanOutcome: null,
+    latestChatbotResult: null,
+    lastCheckedAt: null,
+    isDemo: ctx.isDemo,
+    hasWhatsapp: false,
+    mergedIntoId: null,
+    archivedAt: null,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  await collections.businesses.insertOne(business);
 
-  const businessId = inserted.id;
   const sourceId = `manual:${businessId}`;
   const fallbackUrl = `manual://${ctx.workspaceId}/${businessId}`;
 
-  await db.insert(businessLocations).values({
+  await collections.businessLocations.insertOne({
+    _id: newId(),
     workspaceId: ctx.workspaceId,
     businessId,
     street: normalized.street,
@@ -144,31 +146,48 @@ export async function createManualLead(
     country: normalized.country,
     lat: normalized.lat,
     lng: normalized.lng,
+    formattedAddress: null,
     isPrimary: true,
+    createdAt: timestamp,
   });
 
-  await db.insert(sourceRecords).values({
+  await collections.sourceRecords.insertOne({
+    _id: newId(),
     workspaceId: ctx.workspaceId,
     businessId,
     source: "manual",
     sourceId,
-    payload: { enteredBy: ctx.user.id, createdAt: new Date().toISOString() },
+    payload: { enteredBy: ctx.user.id, createdAt: timestamp.toISOString() },
     attribution: "Entered manually in Lead Finder",
+    importJobId: null,
+    createdAt: timestamp,
   });
 
-  const contactValues: Array<typeof contactPoints.$inferInsert> = [];
-  const evidenceValues: Array<Omit<typeof evidenceRecords.$inferInsert, "workspaceId" | "businessId">> = [];
+  const contactValues: ContactPointDoc[] = [];
+  const evidenceValues: EvidenceRecordDoc[] = [];
 
   if (normalized.email) {
     contactValues.push({
+      _id: newId(),
       workspaceId: ctx.workspaceId,
       businessId,
       type: "email",
       value: normalized.emailDisplay ?? normalized.email,
       normalizedValue: normalized.email,
+      label: null,
+      platform: null,
+      verifiedByUser: false,
       confidence: "medium",
+      firstSeenAt: timestamp,
+      lastSeenAt: timestamp,
+      createdAt: timestamp,
     });
     evidenceValues.push({
+      _id: newId(),
+      workspaceId: ctx.workspaceId,
+      businessId,
+      contactPointId: null,
+      scanResultId: null,
       type: "email",
       originalValue: normalized.emailDisplay ?? normalized.email,
       normalizedValue: normalized.email,
@@ -176,19 +195,32 @@ export async function createManualLead(
       method: "manual-entry",
       confidence: "medium",
       verificationStatus: "unverified",
+      firstSeenAt: timestamp,
+      lastSeenAt: timestamp,
     });
   }
   if (normalized.phone?.e164) {
     contactValues.push({
+      _id: newId(),
       workspaceId: ctx.workspaceId,
       businessId,
       type: "phone",
       value: input.phone?.trim() || normalized.phone.e164,
       normalizedValue: normalized.phone.e164,
       label: normalized.phone.kind,
+      platform: null,
+      verifiedByUser: false,
       confidence: "medium",
+      firstSeenAt: timestamp,
+      lastSeenAt: timestamp,
+      createdAt: timestamp,
     });
     evidenceValues.push({
+      _id: newId(),
+      workspaceId: ctx.workspaceId,
+      businessId,
+      contactPointId: null,
+      scanResultId: null,
       type: "phone",
       originalValue: input.phone?.trim() || normalized.phone.e164,
       normalizedValue: normalized.phone.e164,
@@ -196,44 +228,48 @@ export async function createManualLead(
       method: "manual-entry",
       confidence: "medium",
       verificationStatus: "unverified",
+      firstSeenAt: timestamp,
+      lastSeenAt: timestamp,
     });
   }
 
-  if (contactValues.length) await db.insert(contactPoints).values(contactValues).onConflictDoNothing();
-  if (evidenceValues.length) {
-    await db
-      .insert(evidenceRecords)
-      .values(evidenceValues.map((value) => ({ ...value, workspaceId: ctx.workspaceId, businessId })))
-      .onConflictDoNothing();
+  for (const contact of contactValues) {
+    await collections.contactPoints.updateOne(
+      { businessId, type: contact.type, normalizedValue: contact.normalizedValue },
+      { $setOnInsert: contact },
+      { upsert: true },
+    );
+  }
+  for (const evidence of evidenceValues) {
+    await collections.evidenceRecords.updateOne(
+      {
+        businessId,
+        type: evidence.type,
+        originalValue: evidence.originalValue,
+        sourceUrl: evidence.sourceUrl,
+      },
+      { $setOnInsert: evidence },
+      { upsert: true },
+    );
   }
 
   if (input.tags?.length) {
     const names = [...new Set(input.tags.map((tag) => tag.trim()).filter(Boolean))].slice(0, 20);
     for (const name of names) {
-      await db
-        .insert(tags)
-        .values({ workspaceId: ctx.workspaceId, name })
-        .onConflictDoNothing({ target: [tags.workspaceId, tags.name] });
-      const [tag] = await db
-        .select({ id: tags.id })
-        .from(tags)
-        .where(and(eq(tags.workspaceId, ctx.workspaceId), eq(tags.name, name)))
-        .limit(1);
-      if (tag) {
-        await db
-          .insert(businessTags)
-          .values({ workspaceId: ctx.workspaceId, businessId, tagId: tag.id })
-          .onConflictDoNothing();
-      }
+      const tagId = await ensureTag(ctx.workspaceId, name);
+      await linkTag(ctx.workspaceId, businessId, tagId);
     }
   }
 
-  await db.insert(activities).values({
+  await collections.activities.insertOne({
+    _id: newId(),
     workspaceId: ctx.workspaceId,
     businessId,
     type: "created",
     message: "Lead created manually",
+    metadata: null,
     actorId: ctx.user.id,
+    createdAt: timestamp,
   });
 
   if (match?.decision.action === "merge") {

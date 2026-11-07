@@ -1,8 +1,6 @@
-import { Client } from "pg";
-import { pool } from "@/lib/db";
-import { env } from "@/lib/env";
-
-export const EVENT_CHANNEL = "leadfinder_events";
+import { ObjectId, type Filter } from "mongodb";
+import { collections } from "@/lib/db";
+import type { LiveEventDoc } from "@/lib/db/types";
 
 export type LiveEventType =
   | "lead.updated"
@@ -29,47 +27,110 @@ export interface LiveEvent {
   ts: number;
 }
 
+export interface EventCursor {
+  createdAt: Date;
+  id: string;
+}
+
+const POLL_INTERVAL_MS = 1_000;
+const MAX_PAYLOAD_BYTES = 7_900;
+
+/**
+ * Events are appended to a Mongo collection (expired after an hour by a TTL
+ * index) and streamed by polling. That replaces the previous LISTEN/NOTIFY
+ * connection, which serverless functions cannot keep open.
+ */
 export async function publishEvent(
   workspaceId: string,
   type: LiveEventType,
   payload: Record<string, unknown> = {},
 ): Promise<void> {
-  const message = JSON.stringify({ workspaceId, type, payload, ts: Date.now() } satisfies LiveEvent);
-  if (Buffer.byteLength(message, "utf8") > 7900) {
-    const small = JSON.stringify({ workspaceId, type, payload: { truncated: true }, ts: Date.now() });
-    await pool.query("SELECT pg_notify($1, $2)", [EVENT_CHANNEL, small]);
-    return;
+  let safePayload = payload;
+  if (Buffer.byteLength(JSON.stringify(payload), "utf8") > MAX_PAYLOAD_BYTES) {
+    safePayload = { truncated: true };
   }
-  await pool.query("SELECT pg_notify($1, $2)", [EVENT_CHANNEL, message]);
+  await collections.liveEvents.insertOne({
+    // ObjectId hex sorts by creation time, which makes it a reliable cursor.
+    _id: new ObjectId().toHexString(),
+    workspaceId,
+    type,
+    payload: safePayload,
+    ts: Date.now(),
+    createdAt: new Date(),
+  });
 }
 
-/** Open a dedicated LISTEN connection. Caller owns close(). */
-export async function openEventListener(
+function toLiveEvent(doc: LiveEventDoc): LiveEvent {
+  return {
+    workspaceId: doc.workspaceId,
+    type: doc.type as LiveEventType,
+    payload: doc.payload ?? {},
+    ts: doc.ts,
+  };
+}
+
+export async function listEventsSince(
+  workspaceId: string,
+  cursor: EventCursor | null,
+  limit = 100,
+): Promise<{ events: LiveEvent[]; cursor: EventCursor | null }> {
+  const filter: Filter<LiveEventDoc> = cursor
+    ? {
+        workspaceId,
+        $or: [
+          { createdAt: { $gt: cursor.createdAt } },
+          { createdAt: cursor.createdAt, _id: { $gt: cursor.id } },
+        ],
+      }
+    : { workspaceId };
+
+  const rows = await collections.liveEvents
+    .find(filter)
+    .sort({ createdAt: 1, _id: 1 })
+    .limit(limit)
+    .toArray();
+
+  const last = rows.at(-1);
+  return {
+    events: rows.map(toLiveEvent),
+    cursor: last ? { createdAt: last.createdAt, id: last._id } : cursor,
+  };
+}
+
+/**
+ * Poll for new workspace events until the signal aborts. The caller owns the
+ * abort signal and is responsible for closing the SSE stream.
+ */
+export function openEventListener(
+  workspaceId: string,
   onEvent: (event: LiveEvent) => void,
-): Promise<{ close: () => Promise<void>; ready: Promise<void> }> {
-  const client = new Client({ connectionString: env.databaseUrl });
-  let closed = false;
-  await client.connect();
-  client.on("notification", (message) => {
-    if (!message.payload) return;
+  signal: AbortSignal,
+): { close: () => void } {
+  let cursor: EventCursor | null = null;
+  let running = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const poll = async (): Promise<void> => {
+    if (running || signal.aborted) return;
+    running = true;
     try {
-      const event = JSON.parse(message.payload) as LiveEvent;
-      if (typeof event.workspaceId === "string" && typeof event.type === "string") onEvent(event);
+      const result = await listEventsSince(workspaceId, cursor);
+      cursor = result.cursor;
+      for (const event of result.events) onEvent(event);
     } catch {
-      /* ignore malformed notifications */
+      /* transient database errors must not kill the stream */
+    } finally {
+      running = false;
+      if (!signal.aborted) timer = setTimeout(poll, POLL_INTERVAL_MS);
     }
-  });
-  client.on("error", () => {
-    if (!closed) void client.end().catch(() => undefined);
-  });
-  await client.query(`LISTEN ${EVENT_CHANNEL}`);
+  };
+
+  void poll();
 
   return {
-    ready: Promise.resolve(),
-    close: async () => {
-      if (closed) return;
-      closed = true;
-      await client.end().catch(() => undefined);
+    close: () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
     },
   };
 }

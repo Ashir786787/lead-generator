@@ -58,8 +58,8 @@ that were actually checked.
 | Styling | Tailwind CSS 4, shadcn-style components on Radix UI |
 | Data fetching | TanStack Query, TanStack Table |
 | Validation | Zod 4 |
-| Database | PostgreSQL 16+ (Drizzle ORM) |
-| Jobs | pg-boss 12 worker, or inline jobs on serverless |
+| Database | MongoDB Atlas (official `mongodb` driver 6, GridFS storage) |
+| Jobs | Inline, inside the request (serverless-safe) |
 | Auth | Better Auth (email + password) |
 | Logging | pino |
 | Tests | Vitest + Playwright |
@@ -70,36 +70,24 @@ that were actually checked.
 ```bash
 pnpm install
 
-# 1. Start PostgreSQL
-#    Option A (no Docker required): bundled local Postgres on port 5433
-pnpm db:up
-#    Option B: docker compose up -d
-#    (then set DATABASE_URL to port 5432)
+# 1. Point the app at MongoDB Atlas (or any replica-set deployment)
+#    Set MONGODB_URI and MONGODB_DB in .env.
 
-# 2. Apply migrations
+# 2. Create indexes (idempotent, safe to re-run)
 pnpm db:migrate
 
 # 3. Copy and adjust environment
 #    .env.example documents every variable.
 cp .env.example .env
-#    At minimum set BETTER_AUTH_SECRET to a long random value.
+#    At minimum set MONGODB_URI and BETTER_AUTH_SECRET.
 
-# 4. Run the app and the worker together
-pnpm dev       # http://localhost:3000, also starts the jobs worker
-
-# Prefer separate terminals? Run the web app and worker independently:
-pnpm dev:web
-pnpm worker
+# 4. Run the app
+pnpm dev       # http://localhost:3000
 ```
 
-Website scans, imports and score recalculation are processed by the pg-boss worker. The
-combined `dev`/`start` commands launch it for you; if you use `dev:web` or `start:web` on
-their own, start `pnpm worker` too. The app shows an "Automation worker offline" banner
-when no worker heartbeat is visible, and queued jobs resume as soon as one connects.
-
-On a serverless host there is no worker process. Set `INLINE_JOBS=true` (or deploy to
-Vercel, which sets it automatically) and jobs run inside the request that creates them.
-See [Deployment](#deployment).
+Imports, website scans and score recalculation run inside the request that starts them,
+because serverless hosts have no long-lived worker process. Nothing is queued behind a
+separate service, and `MONGODB_URI` is the only data-store setting required.
 
 On first run the database has zero users. Open `http://localhost:3000/setup` to create
 the owner account. After that, self-service signup is disabled unless
@@ -121,20 +109,15 @@ touches an owner workspace. Run it again at any time to reset the demo.
 
 | Script | Purpose |
 | --- | --- |
-| `pnpm dev` | Next.js dev server + jobs worker |
-| `pnpm dev:web` | Next.js dev server only (start `pnpm worker` too) |
-| `pnpm build` / `pnpm start` | Production build / server + jobs worker |
-| `pnpm start:web` | Production server only (start `pnpm worker` too) |
-| `pnpm worker` | Background worker (imports, scans, exports, scoring, healthcheck) |
+| `pnpm dev` | Next.js dev server |
+| `pnpm build` / `pnpm start` | Production build / server |
 | `pnpm typecheck` | `tsc --noEmit` |
 | `pnpm lint` | ESLint |
-| `pnpm test` | Vitest unit/integration suite |
+| `pnpm test` | Vitest unit/integration suite (uses `leadfinder_test`) |
 | `pnpm test:e2e` | Playwright browser suite |
 | `pnpm check` | typecheck + lint + test + build (release gate) |
-| `pnpm db:up` / `db:down` / `db:status` | Bundled local PostgreSQL |
-| `pnpm db:migrate` | Apply Drizzle migrations |
-| `pnpm db:generate` | Generate a migration after schema changes |
-| `pnpm db:reset` | Drop and recreate the schema (requires `--yes`, refuses production) |
+| `pnpm db:migrate` | Create/refresh all MongoDB indexes |
+| `pnpm db:reset` | Drop and recreate the database (requires `--yes`, refuses production) |
 | `pnpm seed:demo` | Recreate the fictional demo workspace |
 | `pnpm screenshots` | Capture the UI at 1440/1024/390, light/dark |
 | `pnpm fixture:server` | Local fixture server used by scanner tests |
@@ -146,14 +129,13 @@ All variables are documented in [`.env.example`](.env.example). The most importa
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `NEXT_PUBLIC_APP_NAME` | `Lead Finder` | Brand name shown in the UI |
-| `DATABASE_URL` | local port 5433 | PostgreSQL connection string |
+| `MONGODB_URI` | local MongoDB | MongoDB Atlas connection string (replica set) |
+| `MONGODB_DB` | `leadfinder` | Database name |
 | `BETTER_AUTH_SECRET` | dev placeholder | **Must** be replaced in production |
 | `BETTER_AUTH_URL` / `NEXT_PUBLIC_APP_URL` | `http://localhost:3000` | Auth and absolute URL base |
 | `ALLOW_SIGNUP` | `false` | Signup only when zero users, or always when true |
-| `STORAGE_DIR` | `.data/storage` | Upload storage (`/tmp/storage` on Vercel) |
-| `UPLOAD_STORAGE` | `local` | `local` or `database`; defaults to `database` in inline mode |
-| `INLINE_JOBS` | `false` | Run jobs inside the request (auto-enabled on Vercel) |
-| `INLINE_JOB_BUDGET_MS` | `180000` | Inline scan budget before remaining scans are failed honestly |
+| `STORAGE_DIR` | `.data/storage` | Scratch directory for streamed uploads (`/tmp` on Vercel) |
+| `INLINE_JOB_BUDGET_MS` | `180000` | Inline job budget before remaining work is failed honestly |
 | `MAX_UPLOAD_BYTES` | 50 MiB | Upload cap (Vercel request bodies are capped at 4.5 MB) |
 | `SCAN_*` | see example | Timeouts, page count, politeness, UA |
 | `ALLOW_PRIVATE_TARGETS_FOR_TESTS` | `false` | Test-only; startup fails in production |
@@ -166,7 +148,6 @@ All variables are documented in [`.env.example`](.env.example). The most importa
 | `GEMINI_API_KEY` / `GEMINI_MODEL` | empty / `gemini-3.1-flash-lite` | Optional AI search planner and guidance |
 | `GROK_API_KEY` / `GROK_MODEL` | empty / `grok-4` | Optional xAI Grok planner and guidance |
 | `GROQ_API_KEY` / `GROQ_MODEL` | empty / `qwen/qwen3.8-27b` | Optional Groq Cloud planner and guidance (not xAI Grok) |
-| `PG_BOSS_SCHEMA` | `pgboss` | Job queue schema |
 | `LOG_LEVEL` | `info` | pino level |
 
 Production startup refuses to run with the development auth secret or with
@@ -210,37 +191,41 @@ Set `GEOCODE_USER_AGENT` to a real contact URL/email before public deployment.
 
 ## Deployment
 
-### Vercel (serverless, free tier)
+### Vercel (serverless, free tier) + MongoDB Atlas
 
-Vercel has no long-lived worker process or durable local disk, so the app switches to
-**inline jobs** and **database uploads**:
+Vercel has no long-lived worker process or durable local disk, which this app is built
+for: work runs inline and files live in MongoDB.
 
 - Scans, imports and score recalculation run inside the API request that starts them.
-- Uploaded files are stored as base64 in `import_jobs.file_data` and cleared after a
-  successful import. `/tmp` is used only for working files.
-- The worker-offline banner stays hidden because the app reports inline jobs as online.
+- Uploads and exports are stored in MongoDB GridFS (`uploads` and `exports` buckets).
+  `/tmp` is only used while streaming a file through the CSV/ZIP parsers.
+- The import's GridFS object is deleted after a successful import; a failed import keeps
+  it so the job can be retried.
+- Live updates poll a capped `live_events` collection, so they survive serverless
+  connection limits.
 
-Set these environment variables (Vercel sets `VERCEL=1`, which enables the first two
-automatically):
+Set these environment variables:
 
 ```bash
-INLINE_JOBS=true
-UPLOAD_STORAGE=database
-STORAGE_DIR=/tmp/storage
-DATABASE_URL=postgresql://...        # managed Postgres, direct/session connection
+MONGODB_URI=mongodb+srv://user:password@cluster.mongodb.net/leadfinder?retryWrites=true&w=majority
+MONGODB_DB=leadfinder
 BETTER_AUTH_SECRET=...               # openssl rand -base64 32
 BETTER_AUTH_URL=https://your-app.vercel.app
 NEXT_PUBLIC_APP_URL=https://your-app.vercel.app
+STORAGE_DIR=/tmp
 ```
 
 Also set `SCAN_USER_AGENT` and `GEOCODE_USER_AGENT` to a real contact URL/email, plus any
 AI keys you use. Do **not** set `ALLOW_PRIVATE_TARGETS_FOR_TESTS=true` or
 `NODE_ENV=development` in production.
 
-Run migrations against the production database once before the first deploy:
+In Atlas, allow Vercel egress (`0.0.0.0/0` for a starter project, or a narrower Vercel
+integration range) and keep the free M0 cluster on a replica set so transactions work.
+
+Run the index migration against the production database once before the first deploy:
 
 ```bash
-DATABASE_URL="postgresql://...?sslmode=require" pnpm db:migrate
+MONGODB_URI="mongodb+srv://..." MONGODB_DB=leadfinder pnpm db:migrate
 ```
 
 Then deploy from `main`, open `https://your-app.vercel.app/setup`, and create the owner
@@ -249,27 +234,27 @@ redeploy after changing them.
 
 Vercel-specific limits (the UI reports them honestly):
 
-- Function duration is capped at 300 seconds. Inline scans stop starting new work after
-  `INLINE_JOB_BUDGET_MS` (default 180 s) and mark the remainder failed with an explanation.
+- Function duration is capped at 300 seconds. Inline work stops starting new jobs after
+  `INLINE_JOB_BUDGET_MS` (default 180 s) and marks the remainder failed with an explanation.
   Large imports can still exceed the cap; split them into smaller files.
 - Request bodies are capped at 4.5 MB on Hobby, so uploads must be smaller than that even
   though `MAX_UPLOAD_BYTES` allows more locally.
-- Live events use `LISTEN/NOTIFY`; a serverless stream can be cut at the function limit.
-  The UI also polls, so job progress still appears.
-- Use a direct or session-mode Postgres URL (not Neon's transaction pooler) so
-  `LISTEN/NOTIFY` and migrations work.
+- The free Atlas M0 cluster has a shared 512 MB quota. GridFS uploads and exports count
+  toward it, and successful imports release their upload immediately.
+- A serverless stream can be cut at the function limit. The UI also polls the event feed,
+  so job progress still appears.
 
 ### Long-running host (Railway, Render, Fly.io, VPS)
 
-Use one service that runs the web app and worker together (`pnpm start`), a persistent
-volume (for example `/data` mounted with `STORAGE_DIR=/data/storage`), and managed
-PostgreSQL. Keep `INLINE_JOBS=false` and `UPLOAD_STORAGE=local`. This mode removes the
-serverless limits above and is the better choice for large imports or bulk scans.
+Run `pnpm build && pnpm start` against the same MongoDB Atlas cluster, or any MongoDB
+replica set. On non-serverless hosts the same inline model applies; there is no separate
+worker to operate. A persistent volume is not required because GridFS holds uploads;
+`STORAGE_DIR` only needs scratch space.
 
 ## Data safety
 
-- Every workspace-owned table has `workspace_id NOT NULL`; all reads and writes go
-  through a workspace-scoped context.
+- Every workspace-owned document carries `workspaceId`, and every read and write goes
+  through a workspace-scoped context. Indexes lead with `workspaceId`.
 - The isolation suite creates two workspaces and proves cross-workspace reads, updates,
   merges and deletes are impossible.
 - Uploaded archives are checked for entry count, total/entry size, compression ratio and
@@ -277,6 +262,7 @@ serverless limits above and is the better choice for large imports or bulk scans
 - The scanner never follows a redirect or resolves a host that points at a private,
   loopback, link-local, multicast or otherwise non-public address.
 - No secrets are committed. `.env` is ignored; `.env.example` contains placeholders only.
+  Production startup refuses a default auth secret or missing `MONGODB_URI`.
 
 ## Screenshots
 

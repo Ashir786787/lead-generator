@@ -1,6 +1,5 @@
-import { and, asc, eq } from "drizzle-orm";
-import { db } from "@/lib/db";
-import { memberships, user, workspaces } from "@/lib/db/schema";
+import { collections, newId, now } from "@/lib/db";
+import type { WorkspaceDoc } from "@/lib/db/types";
 import type { WorkspaceContext } from "@/lib/auth/session";
 import { assertWorkspaceMembership } from "@/lib/auth/session";
 import { conflict, forbidden, notFound } from "@/lib/api/errors";
@@ -16,40 +15,43 @@ export interface WorkspaceSettings {
 }
 
 export async function getWorkspaceSettings(ctx: WorkspaceContext): Promise<WorkspaceSettings> {
-  const [workspace] = await db
-    .select()
-    .from(workspaces)
-    .where(eq(workspaces.id, ctx.workspaceId))
-    .limit(1);
+  const workspace = await collections.workspaces.findOne({ _id: ctx.workspaceId });
   if (!workspace) throw notFound("Workspace not found.");
 
-  const rows = await db
-    .select({
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      role: memberships.role,
-      createdAt: memberships.createdAt,
-    })
-    .from(memberships)
-    .innerJoin(user, eq(user.id, memberships.userId))
-    .where(eq(memberships.workspaceId, ctx.workspaceId))
-    .orderBy(asc(memberships.createdAt));
+  const memberships = await collections.memberships
+    .find({ workspaceId: ctx.workspaceId })
+    .sort({ createdAt: 1 })
+    .toArray();
+  const users = memberships.length
+    ? await collections.user
+        .find(
+          { _id: { $in: memberships.map((membership) => membership.userId) } },
+          { projection: { _id: 1, name: 1, email: 1 } },
+        )
+        .toArray()
+    : [];
+  const userById = new Map(users.map((user) => [user._id, user]));
 
   return {
-    id: workspace.id,
+    id: workspace._id,
     name: workspace.name,
     slug: workspace.slug,
     timezone: workspace.timezone,
     isDemo: workspace.isDemo,
     countryNotes: workspace.countryNotes ?? {},
-    members: rows.map((row) => ({
-      id: row.id,
-      name: row.name,
-      email: row.email,
-      role: row.role,
-      joinedAt: row.createdAt.toISOString(),
-    })),
+    members: memberships.flatMap((membership) => {
+      const user = userById.get(membership.userId);
+      if (!user) return [];
+      return [
+        {
+          id: user._id,
+          name: user.name,
+          email: user.email,
+          role: membership.role,
+          joinedAt: membership.createdAt.toISOString(),
+        },
+      ];
+    }),
   };
 }
 
@@ -62,7 +64,7 @@ export async function updateWorkspaceSettings(
   },
 ): Promise<void> {
   if (ctx.role !== "owner") throw forbidden("Only a workspace owner can change these settings.");
-  const updates: Partial<typeof workspaces.$inferInsert> = { updatedAt: new Date() };
+  const updates: Partial<WorkspaceDoc> = { updatedAt: now() };
   if (patch.name !== undefined) {
     const name = patch.name.trim().slice(0, 120);
     if (!name) throw conflict("The workspace name cannot be empty.");
@@ -78,7 +80,7 @@ export async function updateWorkspaceSettings(
     updates.timezone = timezone;
   }
   if (patch.countryNotes !== undefined) updates.countryNotes = patch.countryNotes;
-  await db.update(workspaces).set(updates).where(eq(workspaces.id, ctx.workspaceId));
+  await collections.workspaces.updateOne({ _id: ctx.workspaceId }, { $set: updates });
 }
 
 export async function addWorkspaceMember(
@@ -87,18 +89,26 @@ export async function addWorkspaceMember(
 ): Promise<{ id: string; name: string; email: string }> {
   if (ctx.role !== "owner") throw forbidden("Only a workspace owner can add members.");
   const normalized = email.trim().toLowerCase();
-  const [target] = await db.select({ id: user.id, name: user.name, email: user.email }).from(user).where(eq(user.email, normalized)).limit(1);
+  const target = await collections.user.findOne(
+    { email: normalized },
+    { projection: { _id: 1, name: 1, email: 1 } },
+  );
   if (!target) {
     throw conflict("No account uses that email yet. Ask them to create an account first.");
   }
-  const [existing] = await db
-    .select({ id: memberships.id })
-    .from(memberships)
-    .where(and(eq(memberships.workspaceId, ctx.workspaceId), eq(memberships.userId, target.id)))
-    .limit(1);
+  const existing = await collections.memberships.findOne({
+    workspaceId: ctx.workspaceId,
+    userId: target._id,
+  });
   if (existing) throw conflict("That person is already a member of this workspace.");
-  await db.insert(memberships).values({ workspaceId: ctx.workspaceId, userId: target.id, role: "member" });
-  return target;
+  await collections.memberships.insertOne({
+    _id: newId(),
+    workspaceId: ctx.workspaceId,
+    userId: target._id,
+    role: "member",
+    createdAt: now(),
+  });
+  return { id: target._id, name: target.name, email: target.email };
 }
 
 export async function switchWorkspace(ctx: WorkspaceContext, workspaceId: string): Promise<void> {

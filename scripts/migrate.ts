@@ -1,22 +1,24 @@
 import "dotenv/config";
-import { migrate } from "drizzle-orm/node-postgres/migrator";
-import { db, pool } from "@/lib/db";
+import { closeMongo, connectMongo } from "@/lib/db";
+import { ensureIndexes } from "@/lib/db/indexes";
+import { env } from "@/lib/env";
 import { logger } from "@/lib/logger";
 
 /**
- * Applies every pending SQL migration in src/lib/db/migrations.
- * Uses a dedicated advisory lock so two deploys cannot migrate concurrently.
+ * Creates every MongoDB index the application relies on. Index creation is
+ * idempotent, so this is safe to run on every deploy. Serverless requests never
+ * run DDL themselves; they expect these indexes to exist already.
  */
 async function main(): Promise<void> {
-  const client = await pool.connect();
+  const db = await connectMongo();
   try {
-    await client.query("SELECT pg_advisory_lock(918273645)");
-    await migrate(db, { migrationsFolder: "src/lib/db/migrations" });
-    logger.info("Database migrations applied.");
+    await ensureIndexes(db);
+    logger.info(
+      { database: env.mongoDbName },
+      "MongoDB indexes are up to date.",
+    );
   } finally {
-    await client.query("SELECT pg_advisory_unlock(918273645)").catch(() => undefined);
-    client.release();
-    await pool.end();
+    await closeMongo();
   }
 }
 

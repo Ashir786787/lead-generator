@@ -13,20 +13,11 @@ test.describe("website scans", () => {
     await expect(page.getByText(/Scan incomplete|Needs manual review/i).first()).toBeVisible();
   });
 
-  test("does not warn about the worker when automation is running", async ({ page, request }) => {
-    // The pg-boss heartbeat can take up to a minute to appear after startup, so
-    // poll the API before asserting on the server-rendered banner.
-    await expect
-      .poll(
-        async () => {
-          const response = await request.get("/api/scans");
-          if (!response.ok()) return false;
-          const body = await response.json();
-          return body.summary?.workerOnline === true;
-        },
-        { timeout: 90_000, intervals: [2_000], message: "worker heartbeat never appeared" },
-      )
-      .toBe(true);
+  test("runs scans inline without a worker warning", async ({ page, request }) => {
+    const response = await request.get("/api/scans");
+    expect(response.ok()).toBe(true);
+    const body = await response.json();
+    expect(body.summary?.workerOnline).toBe(true);
 
     await page.goto("/scans");
     await expect(page.getByText("Automation worker offline")).toBeHidden();

@@ -1,3 +1,4 @@
+import os from "node:os";
 import "dotenv/config";
 
 function bool(value: string | undefined, fallback = false): boolean {
@@ -18,37 +19,30 @@ function list(value: string | undefined): string[] {
 }
 
 const isVercel = process.env.VERCEL === "1" || Boolean(process.env.VERCEL_ENV);
-/**
- * Serverless platforms have no long-lived worker process. In that mode jobs are
- * executed inside the request that creates them, and uploads are kept in
- * PostgreSQL because the filesystem is ephemeral.
- */
-const inlineJobs = bool(process.env.INLINE_JOBS, isVercel);
-const uploadStorage =
-  process.env.UPLOAD_STORAGE === "database" || process.env.UPLOAD_STORAGE === "local"
-    ? process.env.UPLOAD_STORAGE
-    : inlineJobs
-      ? "database"
-      : "local";
 
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? "development",
   isProduction: process.env.NODE_ENV === "production",
   isTest: process.env.NODE_ENV === "test",
   isVercel,
-  inlineJobs,
-  uploadStorage,
   inlineJobBudgetMs: num(process.env.INLINE_JOB_BUDGET_MS, 180_000),
   appName: process.env.NEXT_PUBLIC_APP_NAME ?? "Lead Finder",
   appUrl: process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000",
-  databaseUrl: process.env.DATABASE_URL ?? "postgres://leadfinder:leadfinder@127.0.0.1:5433/leadfinder",
+  mongoUri:
+    process.env.MONGODB_URI ??
+    "mongodb://127.0.0.1:27017/leadfinder?retryWrites=true&w=majority",
+  mongoDbName: process.env.MONGODB_DB ?? "leadfinder",
   betterAuthSecret:
     process.env.BETTER_AUTH_SECRET ?? "development-only-secret-change-me-0123456789abcdef",
   betterAuthUrl: process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
   allowSignup: bool(process.env.ALLOW_SIGNUP, false),
   ownerEmail: process.env.OWNER_EMAIL ?? "",
   defaultTimezone: process.env.DEFAULT_TIMEZONE ?? "UTC",
-  storageDir: process.env.STORAGE_DIR ?? ".data/storage",
+  // GridFS holds uploads and exports. The filesystem is only used to
+  // materialize a stream for the CSV / ZIP parsers, so a temp dir is enough.
+  storageDir:
+    process.env.STORAGE_DIR ??
+    (isVercel ? os.tmpdir() : ".data/storage"),
   maxUploadBytes: num(process.env.MAX_UPLOAD_BYTES, 50 * 1024 * 1024),
   zip: {
     maxEntries: num(process.env.ZIP_MAX_ENTRIES, 200),
@@ -102,7 +96,6 @@ export const env = {
     cacheMinutes: num(process.env.GEOCODE_CACHE_MINUTES, 1440),
     userAgent: process.env.GEOCODE_USER_AGENT ?? process.env.SCAN_USER_AGENT ?? "LeadFinderBot/1.0",
   },
-  pgBossSchema: process.env.PG_BOSS_SCHEMA ?? "pgboss",
   logLevel: process.env.LOG_LEVEL ?? "info",
 } as const;
 
@@ -118,5 +111,8 @@ export function assertSafeConfig(): void {
   }
   if (env.isProduction && env.betterAuthSecret.includes("development-only")) {
     throw new Error("BETTER_AUTH_SECRET must be set to a strong random value in production.");
+  }
+  if (env.isProduction && !process.env.MONGODB_URI) {
+    throw new Error("MONGODB_URI must be set in production.");
   }
 }

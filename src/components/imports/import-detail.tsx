@@ -166,7 +166,7 @@ export function ImportDetailView({ initial, timezone }: { initial: ImportDetail;
             title="Progress"
             description={
               active
-                ? "The worker is processing rows in the background. This page refreshes automatically."
+                ? "Rows are being processed inside this import. This page refreshes automatically."
                 : detail.status === "completed"
                   ? "This import finished. Rows that needed a human decision are in duplicate review."
                   : "This import is not running."

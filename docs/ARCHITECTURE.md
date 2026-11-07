@@ -2,8 +2,8 @@
 
 ## High-level shape
 
-Lead Finder is a single Next.js application plus one background worker. Both talk to
-the same PostgreSQL database and the same pg-boss schema.
+Lead Finder is a single Next.js application. It talks to one MongoDB Atlas database
+(including GridFS for uploads and exports); there is no separate worker process.
 
 ```
 Browser (React 19 / TanStack Query)
@@ -11,22 +11,16 @@ Browser (React 19 / TanStack Query)
   ▼
 Next.js App Router (route handlers + server components)
   │  workspace-scoped data layer
-  ├──────────────► PostgreSQL (Drizzle ORM)
-  │                   ▲
-  │  send job         │  claim job
-  ▼                   │
-pg-boss ──────────► worker (tsx src/worker/index.ts)
-                      ├─ import.process
-                      ├─ scan.business
-                      ├─ export.generate
-                      ├─ score.recalculate
-                      └─ healthcheck
+  ├──────────────► MongoDB Atlas (official mongodb driver)
+  │                   ├─ lead / import / scan / score collections
+  │                   ├─ live_events (capped, TTL-indexed)
+  │                   └─ GridFS: uploads, exports
+  └── inline work: import, scan, scoring inside the request that starts it
 ```
 
-Long-running work never runs inside a request handler. Uploads are stored, a job is
-enqueued, and the worker does the parsing/scanning. The UI subscribes to
-`GET /api/events` (Server-Sent Events) and invalidates TanStack Query caches when a job
-changes state.
+Imports, scans and score recalculation run inline because serverless hosts have no
+long-lived worker. The UI subscribes to `GET /api/events`, which polls the `live_events`
+collection, and invalidates TanStack Query caches when a job changes state.
 
 ## Directory map
 
@@ -36,29 +30,29 @@ src/components/          UI: shell, feature views, Radix-based primitives
 src/lib/api/             Route wrapper, error envelope, rate limiting
 src/lib/auth/            Better Auth config, session → workspace context, page guards
 src/lib/data/            Workspace-scoped reads, mutations, filters, facets, saved views
-src/lib/db/              Drizzle client, schema, generated migrations
+src/lib/db/              MongoDB client, document types and index definitions
 src/lib/dedupe/          Deterministic decision policy + merge/undo service
 src/lib/discovery/       OSM Overpass, Google Places, AI planning and Nominatim geocoding
-src/lib/events/          In-process SSE event bus
+src/lib/events/          Live-event publisher and Mongo polling reader
 src/lib/export/          CSV generation and export job record
 src/lib/import/          Upload parsing, CSV/ZIP safety, mapping, ingestion
 src/lib/jobs/            pg-boss singleton, queue names and payload types
 src/lib/normalize/       Name, phone, email, website, category normalisation
 src/lib/scan/            SSRF checks, fetcher, HTML extraction, scan orchestration
 src/lib/score/           Score config, engine, profile service
-src/lib/storage/         Local upload storage
-src/worker/              Worker entrypoint and job registrations
-scripts/                 Local DB, migrations, demo seed, screenshots
+src/lib/storage/         GridFS upload/export storage and temp materialisation
+scripts/                 Migrations, demo seed, screenshots
 tests/                   Vitest suites, fixture server, Playwright specs
 docs/                    Architecture, audit, progress, screenshots
 ```
 
 ## Data model
 
-The schema is defined in [`src/lib/db/schema.ts`](../src/lib/db/schema.ts) and applied by
-the generated migration in `src/lib/db/migrations/0000_peaceful_outlaw_kid.sql`.
+The document shapes are defined in [`src/lib/db/types.ts`](../src/lib/db/types.ts) and
+the indexes in [`src/lib/db/indexes.ts`](../src/lib/db/indexes.ts), applied by
+`pnpm db:migrate`.
 
-27 tables:
+27 collections:
 
 - **Auth:** `user`, `session`, `account`, `verification`
 - **Tenancy:** `workspaces`, `memberships`
@@ -69,17 +63,19 @@ the generated migration in `src/lib/db/migrations/0000_peaceful_outlaw_kid.sql`.
 - **Workflow:** `notes`, `tags`, `business_tags`, `activities`, `saved_views`
 - **Dedupe:** `duplicate_candidates`, `merge_history`
 - **Discovery/export:** `saved_searches`, `export_jobs`, `category_mappings`
+- **Live:** `live_events` (one-hour TTL)
 
-22 of those tables are workspace-owned and carry `workspace_id NOT NULL`. The four
-auth tables (`user`, `session`, `account`, `verification`) are global by design.
+22 of those collections are workspace-owned and every document carries `workspaceId`.
+The four auth collections (`user`, `session`, `account`, `verification`) are global by
+design. Indexes lead with `workspaceId`, and uniqueness constraints are scoped to it too.
 
-`businesses` is the canonical lead row. It stores the latest scan summary
-(`latest_scan_id`, `latest_scan_outcome`, `latest_chatbot_result`, `last_checked_at`) so
-list queries stay cheap, while full page-by-page evidence lives in `scan_results` and
-`evidence_records`.
+`businesses` is the canonical lead document. It stores the latest scan summary
+(`latestScanId`, `latestScanOutcome`, `latestChatbotResult`, `lastCheckedAt`) plus
+denormalized `nameTokens` and `hasWhatsapp` flags, so list queries stay cheap. Full
+page-by-page evidence lives in `scan_results` and `evidence_records`.
 
-Merged leads are retained with `merged_into_id` set. This is what makes undo possible
-and keeps foreign-key history intact. All normal queries exclude merged rows.
+Merged leads are retained with `mergedIntoId` set. This is what makes undo possible and
+keeps history intact. All normal queries exclude merged documents.
 
 ## Request lifecycle
 
@@ -112,24 +108,27 @@ proves that cross-workspace reads/updates/merges cannot see or mutate the other 
 
 ## Import pipeline
 
-1. `POST /api/imports` accepts one upload, enforces the size cap, stores it, sniffs the
-   format and builds a preview: headers, guessed mapping, warnings, row hint and any
-   duplicate file.
+1. `POST /api/imports` accepts one upload, enforces the size cap, stores it in GridFS,
+   sniffs the format and builds a preview: headers, guessed mapping, warnings, row hint
+   and any duplicate file.
 2. ZIPs are handled by `src/lib/import/zip.ts`: entry count, per-entry size, total
    uncompressed size and compression ratio are bounded; absolute paths, traversal and
    unsafe entries are rejected. Invalid archives fail deterministically instead of
    hanging.
-3. `POST /api/imports/[id]/start` stores the confirmed mapping and enqueues
-   `import.process`.
-4. The worker parses rows, normalises fields, matches duplicates, inserts or merges, and
-   records row-level errors. Progress is persisted after batches.
+3. `POST /api/imports/[id]/start` stores the confirmed mapping and runs the import inside
+   the request.
+4. The importer materialises the GridFS object to a temp file, parses rows, normalises
+   fields, matches duplicates, inserts or merges, and records row-level errors. Progress
+   is persisted after batches.
 5. Duplicate decisions:
    - `merge` — same phone with similar name, or same registrable domain plus supporting
      name/location evidence.
    - `review` — similar name within a short distance, or ambiguous domain collisions.
    - `none` — no candidate.
    Review pairs appear in `/duplicates` and can be merged or dismissed.
-6. Cancellation is cooperative: the worker checks the job status between batches.
+6. A successful import deletes its GridFS object and clears `storagePath`; a failed
+   import keeps it so the job can be retried. Cancellation is cooperative and checked
+   between batches.
 
 Normalisation is shared by every entry point (import, discovery, manual create, scan):
 
@@ -270,20 +269,20 @@ download with a row count header, and the export is recorded in `export_jobs` fo
 
 ## Jobs
 
-`src/lib/jobs/boss.ts` owns the pg-boss singleton. On start it creates every queue in
-`JOB_NAMES` explicitly — pg-boss 12 does not create queues on demand — and does not cache
-a rejected startup, so a transient database failure can retry.
+There is no queue process. Imports, scans and score recalculation run inside the API
+request that starts them, which is the only model that works on serverless hosts.
 
-| Queue | Work |
+| Work | Where it runs |
 | --- | --- |
-| `import.process` | Parse, dedupe and ingest an uploaded file |
-| `scan.business` | Scan one business website (batches of 5) |
-| `export.generate` | Reserved for large exports |
-| `score.recalculate` | Recalculate every lead after a profile change |
-| `healthcheck` | Worker liveness check |
+| Import ingestion | `POST /api/imports/[id]/start` → `processImport` |
+| Website scans | `POST /api/leads/[id]/scan` / `POST /api/leads/bulk` → `queueScans` |
+| Score recalculation | `POST /api/scoring` → `recalculateWorkspaceScores` |
 
-The worker registers handlers, logs with pino, and is a separate process from the web
-server. Imports and scans require it to be running.
+Jobs still write `status`, `progress` and `finishedAt` to `import_jobs` / `scan_jobs`, so
+the UI can show honest progress and failures. `INLINE_JOB_BUDGET_MS` bounds how long a
+request keeps starting new work; anything left is marked failed with a retry
+explanation rather than silently dropped. Stale `processing` rows left by a killed
+request are recovered on the next attempt.
 
 ## UI
 
@@ -299,10 +298,10 @@ server. Imports and scans require it to be running.
 
 ## Test strategy
 
-- **Vitest (132 tests, 10 files):** normalisation, dedupe policy, scoring engine,
+- **Vitest (145 tests, 10 files):** normalisation, dedupe policy, scoring engine,
   extraction, SSRF/security, import/ZIP parsing, discovery retry/cache, AI plan
   validation and geocode parsing, fetcher fixture server and workspace isolation. The
-  isolation file hits a real PostgreSQL database.
+  isolation file runs against MongoDB (`leadfinder_test`).
 - **Playwright (16 tests):** auth gating, dashboard, leads, lead detail, duplicates,
   imports (including preview), discovery availability, scans, settings, and responsive
   layout at narrow widths.
@@ -315,5 +314,5 @@ server. Imports and scans require it to be running.
   `INTERNAL_ERROR`) and rendered with actionable messages.
 - Invalid uploads fail with a row/entry explanation instead of a partial import.
 - Failed scans are persisted as failures with a reason; they do not silently disappear.
-- Jobs are retried by pg-boss; a failed import job records its error and can be retried.
+- A failed import records its error and can be retried while the GridFS upload remains.
 - The UI distinguishes "no data", "not detected", "unknown" and "scan incomplete".

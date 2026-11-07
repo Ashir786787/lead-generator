@@ -1,1 +1,0 @@
-ALTER TABLE "import_jobs" ADD COLUMN "file_data" text;
