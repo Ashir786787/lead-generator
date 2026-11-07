@@ -20,6 +20,22 @@ function list(value: string | undefined): string[] {
 
 const isVercel = process.env.VERCEL === "1" || Boolean(process.env.VERCEL_ENV);
 
+// On Vercel the project domain is injected by the platform; fall back to it when
+// explicit URLs are not configured so the deployed app keeps working.
+const vercelHost = process.env.VERCEL_PROJECT_PRODUCTION_URL ?? process.env.VERCEL_URL ?? null;
+const vercelOrigin = vercelHost ? `https://${vercelHost.replace(/^https?:\/\//, "")}` : null;
+const DEFAULT_APP_URL = vercelOrigin ?? "http://localhost:3000";
+const trustedOrigins = [
+  ...new Set(
+    [
+      process.env.NEXT_PUBLIC_APP_URL ?? DEFAULT_APP_URL,
+      process.env.BETTER_AUTH_URL ?? DEFAULT_APP_URL,
+      ...(vercelOrigin ? [vercelOrigin] : []),
+      ...list(process.env.TRUSTED_ORIGINS),
+    ].map((origin) => origin.replace(/\/+$/, "")),
+  ),
+];
+
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? "development",
   isProduction: process.env.NODE_ENV === "production",
@@ -27,14 +43,15 @@ export const env = {
   isVercel,
   inlineJobBudgetMs: num(process.env.INLINE_JOB_BUDGET_MS, 180_000),
   appName: process.env.NEXT_PUBLIC_APP_NAME ?? "Lead Finder",
-  appUrl: process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000",
+  appUrl: process.env.NEXT_PUBLIC_APP_URL ?? DEFAULT_APP_URL,
   mongoUri:
     process.env.MONGODB_URI ??
     "mongodb://127.0.0.1:27017/leadfinder?retryWrites=true&w=majority",
   mongoDbName: process.env.MONGODB_DB ?? "leadfinder",
   betterAuthSecret:
     process.env.BETTER_AUTH_SECRET ?? "development-only-secret-change-me-0123456789abcdef",
-  betterAuthUrl: process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
+  betterAuthUrl: process.env.BETTER_AUTH_URL ?? DEFAULT_APP_URL,
+  trustedOrigins,
   allowSignup: bool(process.env.ALLOW_SIGNUP, false),
   ownerEmail: process.env.OWNER_EMAIL ?? "",
   defaultTimezone: process.env.DEFAULT_TIMEZONE ?? "UTC",

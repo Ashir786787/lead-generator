@@ -52,7 +52,7 @@ export const auth = betterAuth({
   appName: env.appName,
   baseURL: env.betterAuthUrl,
   secret: env.betterAuthSecret,
-  trustedOrigins: [env.appUrl, env.betterAuthUrl],
+  trustedOrigins: env.trustedOrigins,
   database: mongodbAdapter(mongoDb, { client: mongoClient, transaction: false }),
   advanced: {
     database: {
