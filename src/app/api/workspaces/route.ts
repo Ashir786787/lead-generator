@@ -21,6 +21,7 @@ const postSchema = z.discriminatedUnion("action", [
     email: z.string().trim().email().max(320),
     password: z.string().min(8, "Use at least 8 characters.").max(128),
     name: z.string().trim().max(120).optional(),
+    destination: z.enum(["shared", "personal"]).default("shared"),
   }),
 ]);
 
@@ -72,6 +73,7 @@ export async function POST(request: Request) {
       email: body.email,
       password: body.password,
       name: body.name,
+      destination: body.destination,
     });
     return NextResponse.json({ member }, { status: 201 });
   });

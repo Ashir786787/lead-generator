@@ -70,6 +70,7 @@ export function SettingsView({
   const [memberName, setMemberName] = React.useState("");
   const [memberEmail, setMemberEmail] = React.useState("");
   const [memberPassword, setMemberPassword] = React.useState("");
+  const [memberDestination, setMemberDestination] = React.useState<"shared" | "personal">("shared");
   const [currentPassword, setCurrentPassword] = React.useState("");
   const [newPassword, setNewPassword] = React.useState("");
   const [confirmPassword, setConfirmPassword] = React.useState("");
@@ -130,7 +131,9 @@ export function SettingsView({
     if (!email || memberPassword.length < 8) return;
     setAdding(true);
     try {
-      const result = await apiFetch<{ member: { created: boolean; passwordUpdated: boolean } }>(
+      const result = await apiFetch<{
+        member: { created: boolean; passwordUpdated: boolean; destination: "shared" | "personal" };
+      }>(
         "/api/workspaces",
         {
           method: "POST",
@@ -139,13 +142,16 @@ export function SettingsView({
             email,
             password: memberPassword,
             name: memberName.trim() || undefined,
+            destination: memberDestination,
           }),
         },
       );
       toast.success(
-        result.member.created
-          ? `Account created and added for ${email}.`
-          : `Password set and ${email} added to the workspace.`,
+        result.member.destination === "personal"
+          ? `Password set for ${email}. They'll find their own personal workspace when they sign in.`
+          : result.member.created
+            ? `Account created and added for ${email}.`
+            : `Password set and ${email} added to the workspace.`,
       );
       setMemberEmail("");
       setMemberPassword("");
@@ -308,8 +314,19 @@ export function SettingsView({
                 <Field
                   label="Add a member"
                   htmlFor="member-email"
-                  hint="Creates the account if it does not exist, sets the password you choose (stored hashed) and adds the person as a member. If the account already exists, the password is reset to what you type. They can change it later in Settings → Security."
+                  hint="Creates the account if it does not exist and sets the password you choose (stored hashed). Pick where they work: join this workspace as a member, or keep their own personal workspace. If the account already exists, its password is reset to what you type."
                 >
+                  <div className="mb-3">
+                    <Select
+                      id="member-destination"
+                      aria-label="Where the member works"
+                      value={memberDestination}
+                      onChange={(event) => setMemberDestination(event.target.value as "shared" | "personal")}
+                    >
+                      <option value="shared">Join this workspace as a member</option>
+                      <option value="personal">Use their own personal workspace (no access to yours)</option>
+                    </Select>
+                  </div>
                   <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_minmax(0,1.2fr)]">
                     <Input
                       id="member-name"

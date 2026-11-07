@@ -1,9 +1,11 @@
 import { hashPassword } from "better-auth/crypto";
 import { collections, newId, now, withTransaction } from "@/lib/db";
-import type { AccountDoc, UserDoc, WorkspaceDoc } from "@/lib/db/types";
+import type { AccountDoc, ScoreProfileDoc, UserDoc, WorkspaceDoc } from "@/lib/db/types";
 import type { WorkspaceContext } from "@/lib/auth/session";
 import { assertWorkspaceMembership } from "@/lib/auth/session";
 import { conflict, forbidden, notFound } from "@/lib/api/errors";
+import { PROFILE_NAME } from "@/lib/score/service";
+import { cloneDefaultConfig } from "@/lib/score/config";
 
 export interface WorkspaceSettings {
   id: string;
@@ -84,6 +86,8 @@ export async function updateWorkspaceSettings(
   await collections.workspaces.updateOne({ _id: ctx.workspaceId }, { $set: updates });
 }
 
+export type MemberDestination = "shared" | "personal";
+
 export interface AddedWorkspaceMember {
   id: string;
   name: string;
@@ -92,18 +96,26 @@ export interface AddedWorkspaceMember {
   created: boolean;
   /** True when an existing account's password was updated. */
   passwordUpdated: boolean;
+  destination: MemberDestination;
+  /** True when a new personal workspace had to be created for them. */
+  personalWorkspaceCreated: boolean;
 }
 
 /**
  * Adds someone to the workspace, creating their account when needed and setting
- * the password the owner types in. Setting a password for an existing account is
- * treated as a deliberate reset: the credential password is updated and every
- * existing session for that account is revoked. Owner accounts cannot be created
- * here — new accounts always join as members.
+ * the password the owner types in. Two destinations are supported:
+ *   - "shared":   they join the current workspace as a regular member.
+ *   - "personal": they keep/own their own workspace and get no access to yours.
+ *     A fresh personal workspace (with its default scoring profile) is created
+ *     for them when they don't own one yet.
+ *
+ * Setting a password for an existing account is treated as a deliberate reset:
+ * the credential password is updated and every existing session for that account
+ * is revoked. Owner accounts cannot be created from the UI.
  */
 export async function addWorkspaceMember(
   ctx: WorkspaceContext,
-  input: { email: string; password: string; name?: string },
+  input: { email: string; password: string; name?: string; destination?: MemberDestination },
 ): Promise<AddedWorkspaceMember> {
   if (ctx.role !== "owner") throw forbidden("Only a workspace owner can add members.");
 
@@ -112,6 +124,7 @@ export async function addWorkspaceMember(
   const password = input.password ?? "";
   if (password.length < 8) throw conflict("Use at least 8 characters for the password.");
   if (password.length > 128) throw conflict("That password is too long (maximum 128 characters).");
+  const destination: MemberDestination = input.destination ?? "shared";
 
   const timestamp = now();
   const passwordHash = await hashPassword(password);
@@ -186,22 +199,84 @@ export async function addWorkspaceMember(
       await collections.session.deleteMany({ userId: user._id }, { session });
     }
 
-    const existing = await collections.memberships.findOne(
-      { workspaceId: ctx.workspaceId, userId: user._id },
-      { session },
-    );
-    if (!existing) {
-      await collections.memberships.insertOne(
-        {
-          _id: newId(),
-          workspaceId: ctx.workspaceId,
-          userId: user._id,
-          role: "member",
-          createdAt: timestamp,
-        },
+    if (destination === "shared") {
+      const existing = await collections.memberships.findOne(
+        { workspaceId: ctx.workspaceId, userId: user._id },
         { session },
       );
+      if (!existing) {
+        await collections.memberships.insertOne(
+          {
+            _id: newId(),
+            workspaceId: ctx.workspaceId,
+            userId: user._id,
+            role: "member",
+            createdAt: timestamp,
+          },
+          { session },
+        );
+      }
+      return {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        created,
+        passwordUpdated: !created,
+        destination: "shared",
+        personalWorkspaceCreated: false,
+      };
     }
+
+    // Personal workspace: reuse one they already own, or create a fresh one.
+    const owned = await collections.memberships.findOne(
+      { userId: user._id, role: "owner" },
+      { session },
+    );
+    if (owned) {
+      return {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        created,
+        passwordUpdated: !created,
+        destination: "personal",
+        personalWorkspaceCreated: false,
+      };
+    }
+
+    const personalWorkspaceId = newId();
+    const workspace: WorkspaceDoc = {
+      _id: personalWorkspaceId,
+      name: `${user.name}'s workspace`.slice(0, 120),
+      slug: `u-${personalWorkspaceId.slice(0, 8)}`,
+      isDemo: false,
+      timezone: ctx.timezone ?? "UTC",
+      countryNotes: {},
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    await collections.workspaces.insertOne(workspace, { session });
+    await collections.memberships.insertOne(
+      {
+        _id: newId(),
+        workspaceId: personalWorkspaceId,
+        userId: user._id,
+        role: "owner",
+        createdAt: timestamp,
+      },
+      { session },
+    );
+    const profile: ScoreProfileDoc = {
+      _id: newId(),
+      workspaceId: personalWorkspaceId,
+      name: PROFILE_NAME,
+      version: 1,
+      isActive: true,
+      config: cloneDefaultConfig(),
+      createdAt: timestamp,
+      createdBy: user._id,
+    };
+    await collections.scoreProfiles.insertOne(profile, { session });
 
     return {
       id: user._id,
@@ -209,6 +284,8 @@ export async function addWorkspaceMember(
       email: user.email,
       created,
       passwordUpdated: !created,
+      destination: "personal",
+      personalWorkspaceCreated: true,
     };
   });
 }
