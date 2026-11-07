@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import {
   Clock,
   Database,
+  KeyRound,
   Loader2,
   Lock,
   Mail,
@@ -17,6 +18,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { apiFetch, errorMessage } from "@/lib/client/api";
+import { authClient } from "@/lib/auth/client";
 import type { WorkspaceSettings } from "@/lib/client/types";
 import { OUTREACH_CHECKLIST } from "@/lib/constants";
 import { formatDate } from "@/lib/utils";
@@ -66,6 +68,10 @@ export function SettingsView({
   const [name, setName] = React.useState(initial.name);
   const [tz, setTz] = React.useState(initial.timezone);
   const [email, setEmail] = React.useState("");
+  const [currentPassword, setCurrentPassword] = React.useState("");
+  const [newPassword, setNewPassword] = React.useState("");
+  const [confirmPassword, setConfirmPassword] = React.useState("");
+  const [changingPassword, setChangingPassword] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [adding, setAdding] = React.useState(false);
 
@@ -86,6 +92,34 @@ export function SettingsView({
       toast.error(errorMessage(error));
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function changePassword() {
+    if (newPassword.length < 8) {
+      toast.error("Use at least 8 characters for the new password.");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      toast.error("The new passwords do not match.");
+      return;
+    }
+    setChangingPassword(true);
+    try {
+      const result = await authClient.changePassword({
+        currentPassword,
+        newPassword,
+        revokeOtherSessions: true,
+      });
+      if (result.error) throw result.error;
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      toast.success("Password changed. Other sessions were signed out.");
+    } catch (error) {
+      toast.error(errorMessage(error));
+    } finally {
+      setChangingPassword(false);
     }
   }
 
@@ -172,6 +206,58 @@ export function SettingsView({
                 ) : (
                   <span className="text-xs text-muted-foreground">Current zone: {settings.timezone}</span>
                 )}
+              </div>
+            </div>
+          </SectionCard>
+
+          <SectionCard
+            title="Security"
+            description="Change the password for your own account. Signs out other sessions."
+          >
+            <div className="space-y-4">
+              <Field label="Current password" htmlFor="current-password" required>
+                <Input
+                  id="current-password"
+                  type="password"
+                  autoComplete="current-password"
+                  value={currentPassword}
+                  onChange={(event) => setCurrentPassword(event.target.value)}
+                  placeholder="Your current password"
+                />
+              </Field>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="New password" htmlFor="new-password" required>
+                  <Input
+                    id="new-password"
+                    type="password"
+                    autoComplete="new-password"
+                    value={newPassword}
+                    onChange={(event) => setNewPassword(event.target.value)}
+                    placeholder="At least 8 characters"
+                  />
+                </Field>
+                <Field label="Confirm new password" htmlFor="confirm-password" required>
+                  <Input
+                    id="confirm-password"
+                    type="password"
+                    autoComplete="new-password"
+                    value={confirmPassword}
+                    onChange={(event) => setConfirmPassword(event.target.value)}
+                    placeholder="Repeat it"
+                  />
+                </Field>
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button
+                  type="button"
+                  onClick={() => void changePassword()}
+                  disabled={changingPassword || !currentPassword || newPassword.length < 8}
+                >
+                  {changingPassword ? <Loader2 className="animate-spin" /> : <KeyRound />} Change password
+                </Button>
+                <span className="text-xs text-muted-foreground">
+                  Forgot it? Ask whoever runs the server to reset it for you.
+                </span>
               </div>
             </div>
           </SectionCard>

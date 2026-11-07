@@ -17,6 +17,7 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "db:migrate": "tsx scripts/migrate.ts",
+    "password:reset": "tsx scripts/reset-password.ts",
     "seed:demo": "tsx scripts/seed-demo.ts",
     "fixture:server": "tsx tests/fixture-server/index.ts",
     "screenshots": "tsx scripts/screenshots.ts",
